@@ -1,0 +1,16 @@
+[package]
+name = "math-to-speech"
+version = "0.1.0"
+edition = "2021"
+description = "LaTeX math to spoken English text, for TTS of mathematical documents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/REPLACE_ME/math-to-speech"
+readme = "README.md"
+keywords = ["latex", "math", "tts", "accessibility"]
+categories = ["text-processing", "accessibility"]
+
+[dependencies]
+anyhow = "1"
+mitex-parser = "0.2"
+mitex-spec-gen = "0.2"
+rowan = "0.15"
