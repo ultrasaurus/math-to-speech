@@ -33,20 +33,83 @@ fn push_word(out: &mut String, word: &str) {
     out.push_str(word);
 }
 
+/// The base and each attached sub/superscript of an `ItemAttachComponent`.
+/// `base` is the node this attachment applies to; `sub`/`sup` are the
+/// scripted content (everything after the `_`/`^` token), phrased as
+/// "sub X" / "to the X" by the caller.
+type Element = NodeOrToken<SyntaxNode, mitex_parser::syntax::SyntaxToken>;
+
 fn speak_children(node: &SyntaxNode, out: &mut String) -> Result<()> {
-    for child in node.children_with_tokens() {
-        speak_element(&child, out)?;
+    let elements: Vec<Element> = node.children_with_tokens().collect();
+    speak_sequence(&elements, out)
+}
+
+/// Walks one flat sibling list (a node's direct children), phrasing
+/// `(...)`/`[...]` as function application when something was just spoken
+/// immediately before the bracket — `x(t)` -> "x of t", `x[n]` -> "x at
+/// index n" (kept distinct from `(...)`  so discrete- and continuous-time
+/// signal notation don't collapse to the same phrase) — or as silent
+/// grouping otherwise, e.g. `[a, b]` as an interval, `(a+b)*c`. `(`/`[`
+/// aren't grouped into their own AST node by `mitex_parser` — they're
+/// plain sibling tokens next to whatever's inside them — so this scan
+/// tracks bracket depth itself to find each matching close.
+fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
+    let mut has_content = false;
+    let mut i = 0;
+    while i < elements.len() {
+        let bracket = match &elements[i] {
+            NodeOrToken::Token(t) if t.kind() == TokenLParen => Some((TokenLParen, TokenRParen, "of")),
+            NodeOrToken::Token(t) if t.kind() == TokenLBracket => Some((TokenLBracket, TokenRBracket, "at index")),
+            _ => None,
+        };
+        if let Some((open_kind, close_kind, word)) = bracket {
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < elements.len() {
+                if let NodeOrToken::Token(t) = &elements[j] {
+                    if t.kind() == open_kind {
+                        depth += 1;
+                    } else if t.kind() == close_kind {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                j += 1;
+            }
+            if j >= elements.len() {
+                bail!("unmatched bracket in math expression");
+            }
+            if has_content {
+                push_word(out, word);
+            }
+            speak_sequence(&elements[i + 1..j], out)?;
+            has_content = true;
+            i = j + 1;
+            continue;
+        }
+
+        speak_element(&elements[i], out)?;
+        if !matches!(&elements[i], NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment)) {
+            has_content = true;
+        }
+        i += 1;
     }
     Ok(())
 }
 
-fn speak_element(element: &NodeOrToken<SyntaxNode, mitex_parser::syntax::SyntaxToken>, out: &mut String) -> Result<()> {
+fn speak_element(element: &Element, out: &mut String) -> Result<()> {
     match element {
         NodeOrToken::Node(node) => speak_node(node, out),
         NodeOrToken::Token(tok) => match tok.kind() {
             TokenWhiteSpace | TokenLineBreak | TokenComment => Ok(()),
             TokenWord => {
                 push_word(out, tok.text());
+                Ok(())
+            }
+            TokenComma => {
+                out.push(',');
                 Ok(())
             }
             TokenLBrace | TokenRBrace => Ok(()),
@@ -59,28 +122,12 @@ fn speak_node(node: &SyntaxNode, out: &mut String) -> Result<()> {
     match node.kind() {
         ScopeRoot | ItemFormula => speak_children(node, out),
         ItemCurly => speak_children(node, out),
-        ItemText => {
-            for tok in node
-                .children_with_tokens()
-                .filter_map(|e| e.into_token())
-            {
-                if tok.kind() == TokenWord {
-                    push_word(out, tok.text());
-                }
-            }
-            Ok(())
-        }
+        ItemText => speak_children(node, out),
         ItemCmd => speak_cmd(node, out),
         ItemAttachComponent => speak_attach(node, out),
         other => bail!("unsupported math construct: {other:?}"),
     }
 }
-
-/// The base and each attached sub/superscript of an `ItemAttachComponent`.
-/// `base` is the node this attachment applies to; `sub`/`sup` are the
-/// scripted content (everything after the `_`/`^` token), phrased as
-/// "sub X" / "to the X" by the caller.
-type Element = NodeOrToken<SyntaxNode, mitex_parser::syntax::SyntaxToken>;
 
 struct Attach {
     base: SyntaxNode,
@@ -92,22 +139,53 @@ fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
     let attach = parse_attach(node)?;
     speak_children(&attach.base, out)?;
     if let Some(sup) = &attach.sup {
-        if let Some(power) = simple_power_word(sup) {
+        if let Some(suffix) = ordinal_suffix(sup) {
+            // No `push_word` here — an ordinal suffix attaches directly to
+            // the base with no space: "n" + "th" -> "nth", not "n th".
+            out.push_str(suffix);
+        } else if let Some(power) = simple_power_word(sup) {
             push_word(out, power);
         } else {
             push_word(out, "to the");
-            for el in sup {
-                speak_element(el, out)?;
-            }
+            speak_sequence(sup, out)?;
         }
     }
     if let Some(sub) = &attach.sub {
         push_word(out, "sub");
-        for el in sub {
-            speak_element(el, out)?;
-        }
+        speak_sequence(sub, out)?;
     }
     Ok(())
+}
+
+/// "th"/"st"/"nd"/"rd" for a braced ordinal superscript (`x^{th}`); `None`
+/// otherwise. Written as `x^{th}` (braces), not `x^th` — LaTeX applies an
+/// unbraced superscript to only the single next character, so `x^th`
+/// parses as `x^t` followed by a plain trailing "h", not this case.
+fn ordinal_suffix(sup: &[Element]) -> Option<&'static str> {
+    let [Element::Node(curly)] = sup else { return None };
+    if curly.kind() != ItemCurly {
+        return None;
+    }
+    let inner: Vec<Element> = curly
+        .children_with_tokens()
+        .filter(|e| !matches!(e, NodeOrToken::Token(t) if t.kind() == TokenLBrace || t.kind() == TokenRBrace))
+        .collect();
+    let [Element::Node(text)] = inner.as_slice() else { return None };
+    if text.kind() != ItemText {
+        return None;
+    }
+    let mut toks = text.children_with_tokens().filter_map(|e| e.into_token());
+    let only = toks.next()?;
+    if toks.next().is_some() || only.kind() != TokenWord {
+        return None;
+    }
+    match only.text() {
+        "st" => Some("st"),
+        "nd" => Some("nd"),
+        "rd" => Some("rd"),
+        "th" => Some("th"),
+        _ => None,
+    }
 }
 
 /// "squared" / "cubed" for a bare `^2` / `^3` superscript; `None` for
@@ -263,6 +341,28 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "sum" => "the sum of",
         "prod" => "the product of",
         "int" => "the integral of",
+        // Named functions: bare here, "of" comes from `speak_sequence`
+        // seeing the `(...)` that follows, e.g. `\sin(x)` -> "sine of x".
+        "sin" => "sine",
+        "cos" => "cosine",
+        "tan" => "tangent",
+        "cot" => "cotangent",
+        "sec" => "secant",
+        "csc" => "cosecant",
+        "arcsin" => "arc sine",
+        "arccos" => "arc cosine",
+        "arctan" => "arc tangent",
+        "sinh" => "hyperbolic sine",
+        "cosh" => "hyperbolic cosine",
+        "tanh" => "hyperbolic tangent",
+        "log" => "log",
+        "ln" => "natural log",
+        "exp" => "the exponential function",
+        "lim" => "the limit of",
+        "min" => "the minimum of",
+        "max" => "the maximum of",
+        "det" => "the determinant of",
+        "gcd" => "the greatest common divisor of",
         _ => return None,
     })
 }
@@ -314,5 +414,52 @@ mod tests {
     #[test]
     fn unsupported_rejected() {
         assert!(speak(r"\begin{matrix}1&2\end{matrix}").is_err());
+    }
+
+    #[test]
+    fn continuous_time_signal() {
+        assert_eq!(speak("x(t)").unwrap(), "x of t");
+    }
+
+    #[test]
+    fn discrete_time_signal() {
+        assert_eq!(speak("x[n]").unwrap(), "x at index n");
+    }
+
+    #[test]
+    fn named_function_with_parens() {
+        assert_eq!(speak(r"\sin(x)").unwrap(), "sine of x");
+        assert_eq!(speak(r"\cos(\omega t)").unwrap(), "cosine of omega t");
+    }
+
+    #[test]
+    fn nested_function_application() {
+        assert_eq!(speak(r"\sin(\cos(x))").unwrap(), "sine of cosine of x");
+    }
+
+    #[test]
+    fn interval_notation_stays_plain_grouping() {
+        assert_eq!(speak("[a, b]").unwrap(), "a, b");
+    }
+
+    #[test]
+    fn plain_grouping_parens_no_of() {
+        assert_eq!(speak("(a+b)").unwrap(), "a+b");
+    }
+
+    #[test]
+    fn ordinal_superscript() {
+        assert_eq!(speak("n^{th}").unwrap(), "nth");
+        assert_eq!(speak("1^{st}").unwrap(), "1st");
+        assert_eq!(speak("2^{nd}").unwrap(), "2nd");
+        assert_eq!(speak("3^{rd}").unwrap(), "3rd");
+    }
+
+    // Unbraced `n^th` is standard LaTeX for `n^t` followed by a plain
+    // trailing "h" — a superscript with no braces only ever applies to the
+    // single next character. Not this crate's call to special-case.
+    #[test]
+    fn unbraced_ordinal_only_takes_one_character() {
+        assert_eq!(speak("n^th").unwrap(), "n to the t h");
     }
 }
