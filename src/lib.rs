@@ -90,6 +90,26 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
             continue;
         }
 
+        // `\left(...\right)` / `\left[...\right]` — mitex_parser groups
+        // these into one `ItemLR` node (unlike bare `(`/`[`, which are
+        // flat sibling tokens, handled above), but the same "of"/"at
+        // index"/plain-grouping decision applies based on the opening
+        // delimiter and whatever preceded it.
+        if let NodeOrToken::Node(node) = &elements[i] {
+            if node.kind() == ItemLR {
+                let (word, inner) = left_right_group(node)?;
+                if has_content {
+                    if let Some(word) = word {
+                        push_word(out, word);
+                    }
+                }
+                speak_sequence(&inner, out)?;
+                has_content = true;
+                i += 1;
+                continue;
+            }
+        }
+
         speak_element(&elements[i], out)?;
         if !matches!(&elements[i], NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment)) {
             has_content = true;
@@ -97,6 +117,33 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
         i += 1;
     }
     Ok(())
+}
+
+/// Splits an `ItemLR` node (`\left DELIM ... \right DELIM`) into the word
+/// to speak for its opening delimiter (`None` for `\left\{`/`\left.`/etc.
+/// — brace and "invisible" delimiters are plain grouping, no "of"/"at
+/// index" trigger word, same as a bare `{...}` group) and its middle
+/// content, as an element list ready for `speak_sequence`.
+fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Element>)> {
+    let children: Vec<Element> = node.children_with_tokens().collect();
+    let clause_positions: Vec<usize> =
+        children.iter().enumerate().filter(|(_, e)| matches!(e, NodeOrToken::Node(n) if n.kind() == ClauseLR)).map(|(i, _)| i).collect();
+    let [open_pos, close_pos] = clause_positions.as_slice() else {
+        bail!("\\left...\\right group with {} clauses, expected 2", clause_positions.len());
+    };
+
+    let NodeOrToken::Node(open_clause) = &children[*open_pos] else { unreachable!() };
+    let word = open_clause
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find_map(|t| match t.kind() {
+            TokenLParen => Some("of"),
+            TokenLBracket => Some("at index"),
+            _ => None,
+        });
+
+    let inner = children[open_pos + 1..*close_pos].to_vec();
+    Ok((word, inner))
 }
 
 /// A `-` glued directly into a word (no surrounding spaces) — `mitex`
@@ -153,6 +200,13 @@ fn speak_element(element: &Element, out: &mut String) -> Result<()> {
             }
             TokenAsterisk => {
                 push_word(out, "asterisk");
+                Ok(())
+            }
+            TokenSlash => {
+                // Same word `\frac{a}{b}` already produces ("a over b"),
+                // so `a / b` and `\frac{a}{b}` read identically regardless
+                // of which way an author wrote the fraction.
+                push_word(out, "over");
                 Ok(())
             }
             TokenLBrace | TokenRBrace => Ok(()),
@@ -376,6 +430,31 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             [content] => speak_children(content, out),
             other => bail!("\\{name} expects 1 argument, found {}", other.len()),
         },
+        // `\red`/`\blue` (bare color shorthand) aren't registered with an
+        // argument in `mitex_parser`'s default command spec, unlike
+        // `\textcolor{color}{body}` below — they parse as a bare 0-arg
+        // command with the following `{X}` as a separate sibling group,
+        // not `\red`'s `ClauseArgument`. So there's nothing to do here but
+        // contribute no words; that sibling `{X}` group already speaks its
+        // own content normally via the generic `ItemCurly` handling in
+        // `speak_node`, which is exactly "keep the content, drop the
+        // color" — color is a visual cue with no bearing on how the math
+        // reads aloud.
+        "red" | "blue" => Ok(()),
+        "textcolor" => match args.as_slice() {
+            // First argument is the color name/spec — ignored, same reason
+            // as `\red`/`\blue` above.
+            [_color, content] => speak_children(content, out),
+            other => bail!("\\textcolor expects 2 arguments, found {}", other.len()),
+        },
+        "cancel" | "xcancel" | "bcancel" => match args.as_slice() {
+            // Canceled-out content is visually struck through specifically
+            // to mark it as removed from the expression — speaking it
+            // would contradict that, so it's silently dropped rather than
+            // read aloud.
+            [_content] => Ok(()),
+            other => bail!("\\{name} expects 1 argument, found {}", other.len()),
+        },
         _ => {
             if let Some(word) = symbol_word(name) {
                 push_word(out, word);
@@ -562,6 +641,27 @@ mod tests {
     }
 
     #[test]
+    fn cancel_content_is_silent() {
+        assert_eq!(speak(r"\cancel{5} \cdot 3").unwrap(), "times 3");
+        assert_eq!(speak(r"\xcancel{5}").unwrap(), "");
+        assert_eq!(speak(r"\bcancel{5}").unwrap(), "");
+    }
+
+    #[test]
+    fn color_commands_speak_only_their_content() {
+        assert_eq!(speak(r"\red{x} + \blue{y}").unwrap(), "x + y");
+        assert_eq!(speak(r"\textcolor{red}{x} + y").unwrap(), "x + y");
+    }
+
+    // The motivating real-world case: colored, canceled units in a
+    // unit-conversion derivation should read as if the canceled parts and
+    // color simply weren't there.
+    #[test]
+    fn colored_cancel_content_is_silent() {
+        assert_eq!(speak(r"\red{\cancel{\text{cycle}}}").unwrap(), "");
+    }
+
+    #[test]
     fn hyphenated_negative_and_subtraction() {
         assert_eq!(speak("-1").unwrap(), "negative 1");
         assert_eq!(speak("N-1").unwrap(), "N minus 1");
@@ -572,6 +672,21 @@ mod tests {
     #[test]
     fn bare_asterisk() {
         assert_eq!(speak("*").unwrap(), "asterisk");
+    }
+
+    #[test]
+    fn slash_division() {
+        assert_eq!(speak("5 / C").unwrap(), "5 over C");
+    }
+
+    #[test]
+    fn left_right_delimiters() {
+        // The motivating real-world case: units in brackets.
+        assert_eq!(speak(r"\left[\frac{\text{W}}{\text{m}^2}\right]").unwrap(), "W over m squared");
+        // Same function-application/grouping rules as bare `(`/`[` apply.
+        assert_eq!(speak(r"x\left(t\right)").unwrap(), "x of t");
+        assert_eq!(speak(r"\left(a+b\right)").unwrap(), "a+b");
+        assert_eq!(speak(r"\left[a, b\right]").unwrap(), "a, b");
     }
 
     #[test]
