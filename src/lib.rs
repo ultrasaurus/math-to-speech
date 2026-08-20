@@ -99,17 +99,60 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
     Ok(())
 }
 
+/// A `-` glued directly into a word (no surrounding spaces) — `mitex`
+/// lexes `N-1`, `5-3`, and even a leading `-1` as one `TokenWord` each, so
+/// there's no separate token to catch the sign generically. `None` if
+/// `word` has no `-` in it at all (the common case, left to the caller's
+/// literal pass-through). Within math mode specifically (unlike general
+/// prose) an embedded `-` essentially never means a hyphenated compound
+/// word, so it's safe to always read it as arithmetic: a leading `-`
+/// ("-1") is a negative number, an internal one ("N-1") is subtraction.
+fn speak_hyphenated_word(word: &str) -> Option<String> {
+    if !word.contains('-') {
+        return None;
+    }
+    let mut parts = word.split('-');
+    let first = parts.next().unwrap_or("");
+    if first.is_empty() {
+        Some(format!("negative {}", parts.collect::<Vec<_>>().join(" minus ")))
+    } else {
+        let mut phrase = first.to_string();
+        for part in parts {
+            phrase.push_str(" minus ");
+            phrase.push_str(part);
+        }
+        Some(phrase)
+    }
+}
+
 fn speak_element(element: &Element, out: &mut String) -> Result<()> {
     match element {
         NodeOrToken::Node(node) => speak_node(node, out),
         NodeOrToken::Token(tok) => match tok.kind() {
             TokenWhiteSpace | TokenLineBreak | TokenComment => Ok(()),
             TokenWord => {
-                push_word(out, tok.text());
+                // A bare `=` (spaced apart from its operands, so it lexes
+                // as its own token rather than fusing into a larger word
+                // like `x=y`) needs spelling as a word, same as `\leq`
+                // etc. already are — left as the literal character, some
+                // TTS engines (confirmed: misaki/espeak) silently produce
+                // no phonemes for it at all, dropping it from the audio
+                // rather than mispronouncing it.
+                if tok.text() == "=" {
+                    push_word(out, "equals");
+                } else if let Some(phrase) = speak_hyphenated_word(tok.text()) {
+                    push_word(out, &phrase);
+                } else {
+                    push_word(out, tok.text());
+                }
                 Ok(())
             }
             TokenComma => {
                 out.push(',');
+                Ok(())
+            }
+            TokenAsterisk => {
+                push_word(out, "asterisk");
                 Ok(())
             }
             TokenLBrace | TokenRBrace => Ok(()),
@@ -145,6 +188,8 @@ fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
             out.push_str(suffix);
         } else if let Some(power) = simple_power_word(sup) {
             push_word(out, power);
+        } else if is_degree_symbol(sup) {
+            push_word(out, "degrees");
         } else {
             push_word(out, "to the");
             speak_sequence(sup, out)?;
@@ -157,12 +202,16 @@ fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
     Ok(())
 }
 
-/// "th"/"st"/"nd"/"rd" for a braced ordinal superscript (`x^{th}`); `None`
-/// otherwise. Written as `x^{th}` (braces), not `x^th` — LaTeX applies an
-/// unbraced superscript to only the single next character, so `x^th`
-/// parses as `x^t` followed by a plain trailing "h", not this case.
+/// "th"/"st"/"nd"/"rd" for a braced ordinal superscript — `x^{th}` or
+/// `x^\text{th}` (both common; authors reach for `\text{}` specifically to
+/// keep the suffix upright/non-italic in rendered math, so both must
+/// resolve the same way) — `None` otherwise. Written with braces, not
+/// `x^th`: LaTeX applies an unbraced superscript to only the single next
+/// character, so `x^th` parses as `x^t` followed by a plain trailing "h",
+/// not this case.
 fn ordinal_suffix(sup: &[Element]) -> Option<&'static str> {
-    let [Element::Node(curly)] = sup else { return None };
+    let [Element::Node(node)] = sup else { return None };
+    let curly = unwrap_text_command(node)?;
     if curly.kind() != ItemCurly {
         return None;
     }
@@ -186,6 +235,49 @@ fn ordinal_suffix(sup: &[Element]) -> Option<&'static str> {
         "th" => Some("th"),
         _ => None,
     }
+}
+
+/// `true` for a bare `\circ` superscript (`360^\circ`) — the standard way
+/// to write a degree symbol in LaTeX math. Kept separate from
+/// `ordinal_suffix`/`simple_power_word`: "degrees" is a full word attached
+/// with a space ("360 degrees"), not concatenated like an ordinal suffix
+/// ("nth") or a single power word.
+fn is_degree_symbol(sup: &[Element]) -> bool {
+    let [Element::Node(cmd)] = sup else { return false };
+    if cmd.kind() != ItemCmd {
+        return false;
+    }
+    let Some(name_tok) = cmd
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == ClauseCommandName)
+    else {
+        return false;
+    };
+    name_tok.text().trim_start_matches('\\') == "circ"
+}
+
+/// `\text{...}` wrapping a single braced argument — unwraps it to that
+/// `ItemCurly` node, so a superscript shape check can treat `x^\text{th}`
+/// the same as `x^{th}`. Returns `node` itself unchanged if it isn't a
+/// `\text` command (so a bare `ItemCurly` passes straight through).
+fn unwrap_text_command(node: &SyntaxNode) -> Option<SyntaxNode> {
+    if node.kind() != ItemCmd {
+        return Some(node.clone());
+    }
+    let name_tok = node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == ClauseCommandName)?;
+    if name_tok.text().trim_start_matches('\\') != "text" {
+        return None;
+    }
+    let arg = node.children().find(|n| n.kind() == ClauseArgument)?;
+    let children: Vec<Element> = arg.children_with_tokens().collect();
+    let [Element::Node(curly)] = children.as_slice() else {
+        return None;
+    };
+    Some(curly.clone())
 }
 
 /// "squared" / "cubed" for a bare `^2` / `^3` superscript; `None` for
@@ -363,6 +455,7 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "max" => "the maximum of",
         "det" => "the determinant of",
         "gcd" => "the greatest common divisor of",
+        "dots" | "ldots" | "cdots" | "vdots" | "ddots" => "dot dot dot",
         _ => return None,
     })
 }
@@ -453,6 +546,43 @@ mod tests {
         assert_eq!(speak("1^{st}").unwrap(), "1st");
         assert_eq!(speak("2^{nd}").unwrap(), "2nd");
         assert_eq!(speak("3^{rd}").unwrap(), "3rd");
+    }
+
+    // `\text{th}` (not just bare `{th}`) is a common way authors write an
+    // ordinal suffix, to keep it upright/non-italic in rendered math.
+    #[test]
+    fn ordinal_superscript_wrapped_in_text_command() {
+        assert_eq!(speak(r"n^\text{th}").unwrap(), "nth");
+        assert_eq!(speak(r"1^\text{st}").unwrap(), "1st");
+    }
+
+    #[test]
+    fn degree_symbol() {
+        assert_eq!(speak(r"360^\circ").unwrap(), "360 degrees");
+    }
+
+    #[test]
+    fn hyphenated_negative_and_subtraction() {
+        assert_eq!(speak("-1").unwrap(), "negative 1");
+        assert_eq!(speak("N-1").unwrap(), "N minus 1");
+        assert_eq!(speak("5-3").unwrap(), "5 minus 3");
+        assert_eq!(speak(r"0, 1, 2, \dots, N-1").unwrap(), "0, 1, 2, dot dot dot, N minus 1");
+    }
+
+    #[test]
+    fn bare_asterisk() {
+        assert_eq!(speak("*").unwrap(), "asterisk");
+    }
+
+    #[test]
+    fn bare_equals_sign_spoken_as_word() {
+        assert_eq!(speak("y = g(x)").unwrap(), "y equals g of x");
+    }
+
+    #[test]
+    fn ellipsis_commands() {
+        assert_eq!(speak(r"0, 1, 2, \dots").unwrap(), "0, 1, 2, dot dot dot");
+        assert_eq!(speak(r"\cdots").unwrap(), "dot dot dot");
     }
 
     // Unbraced `n^th` is standard LaTeX for `n^t` followed by a plain
