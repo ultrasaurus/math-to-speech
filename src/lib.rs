@@ -146,30 +146,59 @@ fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Elem
     Ok((word, inner))
 }
 
-/// A `-` glued directly into a word (no surrounding spaces) — `mitex`
-/// lexes `N-1`, `5-3`, and even a leading `-1` as one `TokenWord` each, so
-/// there's no separate token to catch the sign generically. `None` if
-/// `word` has no `-` in it at all (the common case, left to the caller's
-/// literal pass-through). Within math mode specifically (unlike general
-/// prose) an embedded `-` essentially never means a hyphenated compound
-/// word, so it's safe to always read it as arithmetic: a leading `-`
-/// ("-1") is a negative number, an internal one ("N-1") is subtraction.
-fn speak_hyphenated_word(word: &str) -> Option<String> {
-    if !word.contains('-') {
+/// `-`/`=`/`<`/`>` glued directly into a word (no surrounding spaces) —
+/// `mitex` lexes `N-1`, `x=y`, `t<0`, and even a leading `-1` as one
+/// `TokenWord` each, so there's no separate token to catch these
+/// operators generically the way a *spaced* `=` or `<` is (a bare
+/// standalone token, handled by `speak_element`'s literal `TokenWord`
+/// branch calling this same function). `None` if `word` has none of these
+/// characters at all (the common case, left to the caller's literal
+/// pass-through). Within math mode specifically (unlike general prose) an
+/// embedded `-` essentially never means a hyphenated compound word, so
+/// it's safe to always read it as arithmetic: a leading `-` ("-1") is a
+/// negative number, an internal one ("N-1") is subtraction; `=`/`<`/`>`
+/// are always spelled as words regardless of position — left as the
+/// literal character, some TTS engines (confirmed: misaki/espeak, and the
+/// vibe/F5 model) silently produce no phonemes for them at all, dropping
+/// them from the audio rather than mispronouncing them.
+fn speak_operator_word(word: &str) -> Option<String> {
+    if !word.contains(['-', '=', '<', '>']) {
         return None;
     }
-    let mut parts = word.split('-');
-    let first = parts.next().unwrap_or("");
-    if first.is_empty() {
-        Some(format!("negative {}", parts.collect::<Vec<_>>().join(" minus ")))
-    } else {
-        let mut phrase = first.to_string();
-        for part in parts {
-            phrase.push_str(" minus ");
-            phrase.push_str(part);
+    let chars: Vec<char> = word.chars().collect();
+    let mut phrase = String::new();
+    let mut segment_start = 0;
+    let mut wrote_any = false;
+
+    let push = |phrase: &mut String, wrote_any: &mut bool, text: &str| {
+        if text.is_empty() {
+            return;
         }
-        Some(phrase)
+        if *wrote_any {
+            phrase.push(' ');
+        }
+        phrase.push_str(text);
+        *wrote_any = true;
+    };
+
+    for (i, &c) in chars.iter().enumerate() {
+        let op_word = match c {
+            '-' if i == 0 => Some("negative"),
+            '-' => Some("minus"),
+            '=' => Some("equals"),
+            '<' => Some("less than"),
+            '>' => Some("greater than"),
+            _ => None,
+        };
+        let Some(op_word) = op_word else { continue };
+        let segment: String = chars[segment_start..i].iter().collect();
+        push(&mut phrase, &mut wrote_any, &segment);
+        push(&mut phrase, &mut wrote_any, op_word);
+        segment_start = i + 1;
     }
+    let tail: String = chars[segment_start..].iter().collect();
+    push(&mut phrase, &mut wrote_any, &tail);
+    Some(phrase)
 }
 
 fn speak_element(element: &Element, out: &mut String) -> Result<()> {
@@ -178,16 +207,7 @@ fn speak_element(element: &Element, out: &mut String) -> Result<()> {
         NodeOrToken::Token(tok) => match tok.kind() {
             TokenWhiteSpace | TokenLineBreak | TokenComment => Ok(()),
             TokenWord => {
-                // A bare `=` (spaced apart from its operands, so it lexes
-                // as its own token rather than fusing into a larger word
-                // like `x=y`) needs spelling as a word, same as `\leq`
-                // etc. already are — left as the literal character, some
-                // TTS engines (confirmed: misaki/espeak) silently produce
-                // no phonemes for it at all, dropping it from the audio
-                // rather than mispronouncing it.
-                if tok.text() == "=" {
-                    push_word(out, "equals");
-                } else if let Some(phrase) = speak_hyphenated_word(tok.text()) {
+                if let Some(phrase) = speak_operator_word(tok.text()) {
                     push_word(out, &phrase);
                 } else {
                     push_word(out, tok.text());
@@ -506,6 +526,7 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "geq" | "ge" => "greater than or equal to",
         "neq" | "ne" => "not equal to",
         "approx" => "approximately",
+        "propto" => "is proportional to",
         "times" => "times",
         "cdot" => "times",
         "pm" => "plus or minus",
@@ -670,6 +691,20 @@ mod tests {
     }
 
     #[test]
+    fn comparison_operators_spoken_spaced_or_glued() {
+        assert_eq!(speak("t < 0").unwrap(), "t less than 0");
+        assert_eq!(speak("t<0").unwrap(), "t less than 0");
+        assert_eq!(speak("t > 0").unwrap(), "t greater than 0");
+        assert_eq!(speak("t>0").unwrap(), "t greater than 0");
+    }
+
+    #[test]
+    fn equals_sign_spoken_spaced_or_glued() {
+        assert_eq!(speak("x = y").unwrap(), "x equals y");
+        assert_eq!(speak("x=y").unwrap(), "x equals y");
+    }
+
+    #[test]
     fn bare_asterisk() {
         assert_eq!(speak("*").unwrap(), "asterisk");
     }
@@ -687,6 +722,11 @@ mod tests {
         assert_eq!(speak(r"x\left(t\right)").unwrap(), "x of t");
         assert_eq!(speak(r"\left(a+b\right)").unwrap(), "a+b");
         assert_eq!(speak(r"\left[a, b\right]").unwrap(), "a, b");
+    }
+
+    #[test]
+    fn proportional_to() {
+        assert_eq!(speak(r"I \propto p^2").unwrap(), "I is proportional to p squared");
     }
 
     #[test]

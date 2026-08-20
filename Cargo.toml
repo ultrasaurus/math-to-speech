@@ -1,6 +1,6 @@
 [package]
 name = "math-to-speech"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "LaTeX math to spoken English text, for TTS of mathematical documents"
 license = "MIT OR Apache-2.0"
