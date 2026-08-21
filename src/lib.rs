@@ -233,6 +233,14 @@ fn speak_element(element: &Element, out: &mut String) -> Result<()> {
             // LaTeX's non-breaking space (`~`) — a spacing/typesetting
             // hint, not something with its own pronunciation.
             TokenTilde => Ok(()),
+            // `\begin{...}...\end{...}` environments (align*/split/cases)
+            // — see `speak_env`'s doc comment for why both are silent/a
+            // pause rather than spoken words.
+            TokenAmpersand => Ok(()),
+            ItemNewLine => {
+                out.push(',');
+                Ok(())
+            }
             TokenLBrace | TokenRBrace => Ok(()),
             other => bail!("unsupported token in math expression: {other:?} ({:?})", tok.text()),
         },
@@ -246,8 +254,50 @@ fn speak_node(node: &SyntaxNode, out: &mut String) -> Result<()> {
         ItemText => speak_children(node, out),
         ItemCmd => speak_cmd(node, out),
         ItemAttachComponent => speak_attach(node, out),
+        ItemEnv => speak_env(node, out),
         other => bail!("unsupported math construct: {other:?}"),
     }
+}
+
+/// `\begin{env}...\end{env}` — handled uniformly for a whitelist of
+/// "linear equation sequence" environments (`align`/`align*`, `split`,
+/// `cases`, `aligned`, `eqnarray`/`eqnarray*`, `gather`/`gather*`,
+/// `multline`/`multline*`): `env`'s own name (from `ItemBegin`/`ItemEnd`,
+/// filtered out here) is purely structural, never spoken; `&` (column
+/// alignment, `TokenAmpersand`) carries no meaning of its own either —
+/// for `align*`/`split` it just marks where the `=` lines up, and for
+/// `cases` the condition after it is already written out in prose by the
+/// author (`\text{if } n = 0`), so there's nothing to inject — silent in
+/// both. `\\` (row break, `ItemNewLine`) becomes a comma pause between
+/// rows.
+///
+/// A true grid environment (`matrix`/`pmatrix`/`bmatrix`/`vmatrix`/
+/// `Vmatrix`/`smallmatrix`/`array`) is deliberately *not* in that
+/// whitelist and stays rejected: flattening rows/columns to comma pauses
+/// the same way would lose the 2D structure a matrix's shape actually
+/// conveys, rather than just skip a cosmetic alignment mark — this
+/// crate's "reject rather than guess" policy applies to it, not the
+/// equation-sequence environments above.
+fn speak_env(node: &SyntaxNode, out: &mut String) -> Result<()> {
+    const EQUATION_SEQUENCE_ENVS: &[&str] = &[
+        "align", "align*", "split", "cases", "aligned", "eqnarray", "eqnarray*", "gather",
+        "gather*", "multline", "multline*",
+    ];
+    let env_name = node
+        .children()
+        .find(|n| n.kind() == ItemBegin)
+        .and_then(|begin| begin.children_with_tokens().filter_map(|e| e.into_token()).next())
+        .map(|t| t.text().to_string())
+        .unwrap_or_default();
+    if !EQUATION_SEQUENCE_ENVS.contains(&env_name.as_str()) {
+        bail!("unsupported environment: {env_name}");
+    }
+
+    let elements: Vec<Element> = node
+        .children_with_tokens()
+        .filter(|e| !matches!(e, NodeOrToken::Node(n) if n.kind() == ItemBegin || n.kind() == ItemEnd))
+        .collect();
+    speak_sequence(&elements, out)
 }
 
 struct Attach {
@@ -565,6 +615,14 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
         // Pure spacing commands — genuinely no argument, no bearing on how
         // the surrounding math sounds.
         "quad" | ";" => Ok(()),
+        // `\phantom{X}` reserves layout space shaped like `X` without
+        // rendering it — purely an alignment device, so unlike `\text`
+        // etc. its argument must *not* be spoken (that would read content
+        // the formula deliberately hides).
+        "phantom" | "vphantom" | "hphantom" => match args.as_slice() {
+            [_content] => Ok(()),
+            other => bail!("\\{name} expects 1 argument, found {}", other.len()),
+        },
         // Unlike `\quad`/`\;`, `\displaystyle` is greedy — it consumes
         // everything after it up to the end of its group as one
         // `ClauseArgument` (confirmed: `a \displaystyle b` parses with
@@ -990,6 +1048,12 @@ mod tests {
     }
 
     #[test]
+    fn phantom_content_is_never_spoken() {
+        assert_eq!(speak(r"a \phantom{x} b").unwrap(), "a b");
+        assert_eq!(speak(r"a \vphantom{x} b").unwrap(), "a b");
+    }
+
+    #[test]
     fn additional_symbols() {
         assert_eq!(speak(r"d \in N").unwrap(), "d is an element of N");
         assert_eq!(speak(r"m \notin S").unwrap(), "m is not an element of S");
@@ -1043,6 +1107,43 @@ mod tests {
     #[test]
     fn underbrace_speaks_content() {
         assert_eq!(speak(r"\underbrace{0, 0}").unwrap(), "0, 0");
+    }
+
+    #[test]
+    fn split_environment() {
+        assert_eq!(speak(r"\begin{split} x &= 1\\ &= 2 \end{split}").unwrap(), "x equals 1, equals 2");
+    }
+
+    #[test]
+    fn align_environment() {
+        assert_eq!(speak(r"\begin{align*} a &= 1\\ b &= 2 \end{align*}").unwrap(), "a equals 1, b equals 2");
+    }
+
+    #[test]
+    fn cases_environment() {
+        // The author already writes "if"/"otherwise" as prose (`\text{if
+        // }`), so the environment itself contributes only the row-break
+        // pause between the two cases — no connective word is injected.
+        assert_eq!(
+            speak(r"\begin{cases} 1 & \text{if } n = 0\\ 0 & \text{otherwise}. \end{cases}").unwrap(),
+            "1 if n equals 0, 0 otherwise ."
+        );
+    }
+
+    // The real motivating case: a multi-line sum with `=&` alignment
+    // (equals sign before the column break) and a trailing "+" continuing
+    // onto the next row.
+    #[test]
+    fn align_environment_real_world_sum() {
+        assert_eq!(
+            speak(
+                r"\begin{align*} x(t) =& A_1 \cdot \cos(2\pi \cdot f_1 \cdot t + \phi_1) \;+\\ &A_2\cdot \cos(2\pi \cdot f_2\cdot t + \phi_2) \;+\\ &A_3\cdot \cos(2\pi \cdot f_3\cdot t + \phi_3) + \cdots \end{align*}"
+            )
+            .unwrap(),
+            "x of t equals A sub 1 times cosine of 2 pi times f sub 1 times t plus phi sub 1 plus, \
+             A sub 2 times cosine of 2 pi times f sub 2 times t plus phi sub 2 plus, \
+             A sub 3 times cosine of 2 pi times f sub 3 times t plus phi sub 3 plus dot dot dot"
+        );
     }
 
     #[test]
