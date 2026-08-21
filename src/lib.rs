@@ -146,9 +146,9 @@ fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Elem
     Ok((word, inner))
 }
 
-/// `-`/`=`/`<`/`>` glued directly into a word (no surrounding spaces) —
-/// `mitex` lexes `N-1`, `x=y`, `t<0`, and even a leading `-1` as one
-/// `TokenWord` each, so there's no separate token to catch these
+/// `-`/`+`/`=`/`<`/`>` glued directly into a word (no surrounding spaces)
+/// — `mitex` lexes `N-1`, `t+t_0`, `x=y`, `t<0`, and even a leading `-1`
+/// as one `TokenWord` each, so there's no separate token to catch these
 /// operators generically the way a *spaced* `=` or `<` is (a bare
 /// standalone token, handled by `speak_element`'s literal `TokenWord`
 /// branch calling this same function). `None` if `word` has none of these
@@ -156,13 +156,13 @@ fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Elem
 /// pass-through). Within math mode specifically (unlike general prose) an
 /// embedded `-` essentially never means a hyphenated compound word, so
 /// it's safe to always read it as arithmetic: a leading `-` ("-1") is a
-/// negative number, an internal one ("N-1") is subtraction; `=`/`<`/`>`
-/// are always spelled as words regardless of position — left as the
+/// negative number, an internal one ("N-1") is subtraction; `+`/`=`/`<`/
+/// `>` are always spelled as words regardless of position — left as the
 /// literal character, some TTS engines (confirmed: misaki/espeak, and the
 /// vibe/F5 model) silently produce no phonemes for them at all, dropping
 /// them from the audio rather than mispronouncing them.
 fn speak_operator_word(word: &str) -> Option<String> {
-    if !word.contains(['-', '=', '<', '>']) {
+    if !word.contains(['-', '+', '=', '<', '>']) {
         return None;
     }
     let chars: Vec<char> = word.chars().collect();
@@ -185,6 +185,7 @@ fn speak_operator_word(word: &str) -> Option<String> {
         let op_word = match c {
             '-' if i == 0 => Some("negative"),
             '-' => Some("minus"),
+            '+' => Some("plus"),
             '=' => Some("equals"),
             '<' => Some("less than"),
             '>' => Some("greater than"),
@@ -229,6 +230,9 @@ fn speak_element(element: &Element, out: &mut String) -> Result<()> {
                 push_word(out, "over");
                 Ok(())
             }
+            // LaTeX's non-breaking space (`~`) — a spacing/typesetting
+            // hint, not something with its own pronunciation.
+            TokenTilde => Ok(()),
             TokenLBrace | TokenRBrace => Ok(()),
             other => bail!("unsupported token in math expression: {other:?} ({:?})", tok.text()),
         },
@@ -250,6 +254,11 @@ struct Attach {
     base: SyntaxNode,
     sub: Option<Vec<Element>>,
     sup: Option<Vec<Element>>,
+    /// Count of `'` marks attached to `base` (`f'` -> 1, `f''` -> 2, ...).
+    /// Unlike `sub`/`sup`, `mitex_parser` gives an apostrophe no scripted
+    /// content of its own to capture — it's a bare marker, so this is just
+    /// a count rather than an `Option<Vec<Element>>`.
+    prime_count: usize,
 }
 
 fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
@@ -272,6 +281,21 @@ fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
     if let Some(sub) = &attach.sub {
         push_word(out, "sub");
         speak_sequence(sub, out)?;
+    }
+    // `f'` -> "f prime", `f''` -> "f double prime", `f'''` -> "f triple
+    // prime" (derivative notation) — higher counts are vanishingly rare in
+    // practice, so just repeating "prime" is a reasonable fallback rather
+    // than a construct worth a full ordinal-naming table.
+    match attach.prime_count {
+        0 => {}
+        1 => push_word(out, "prime"),
+        2 => push_word(out, "double prime"),
+        3 => push_word(out, "triple prime"),
+        n => {
+            for _ in 0..n {
+                push_word(out, "prime");
+            }
+        }
     }
     Ok(())
 }
@@ -376,6 +400,7 @@ fn parse_attach(node: &SyntaxNode) -> Result<Attach> {
     let mut base_node = node.clone();
     let mut sub = None;
     let mut sup = None;
+    let mut prime_count = 0usize;
     loop {
         let elements: Vec<Element> = base_node.children_with_tokens().collect();
         let Some(NodeOrToken::Node(arg)) = elements.first() else {
@@ -385,15 +410,26 @@ fn parse_attach(node: &SyntaxNode) -> Result<Attach> {
 
         let script_start = elements
             .iter()
-            .position(|e| matches!(e, NodeOrToken::Token(t) if t.kind() == TokenUnderscore || t.kind() == TokenCaret))
+            .position(|e| matches!(e, NodeOrToken::Token(t) if matches!(t.kind(), TokenUnderscore | TokenCaret | TokenApostrophe)))
             .ok_or_else(|| anyhow::anyhow!("attachment with no _ or ^ token"))?;
-        let is_sub = matches!(&elements[script_start], NodeOrToken::Token(t) if t.kind() == TokenUnderscore);
-        let script_content: Vec<Element> = elements[script_start + 1..].to_vec();
-
-        if is_sub {
-            sub.get_or_insert(script_content);
-        } else {
-            sup.get_or_insert(script_content);
+        match &elements[script_start] {
+            // `'` (derivative notation, `f'`) has no scripted content of
+            // its own — `mitex_parser` gives it `has_script: false`, so
+            // there's nothing after it at this level to capture, only the
+            // mark itself to count.
+            NodeOrToken::Token(t) if t.kind() == TokenApostrophe => {
+                prime_count += 1;
+            }
+            NodeOrToken::Token(t) => {
+                let is_sub = t.kind() == TokenUnderscore;
+                let script_content: Vec<Element> = elements[script_start + 1..].to_vec();
+                if is_sub {
+                    sub.get_or_insert(script_content);
+                } else {
+                    sup.get_or_insert(script_content);
+                }
+            }
+            _ => unreachable!(),
         }
 
         let inner = arg.children().next();
@@ -402,7 +438,7 @@ fn parse_attach(node: &SyntaxNode) -> Result<Attach> {
                 base_node = inner;
                 continue;
             }
-            _ => return Ok(Attach { base: arg, sub, sup }),
+            _ => return Ok(Attach { base: arg, sub, sup, prime_count }),
         }
     }
 }
@@ -446,21 +482,100 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             }
             Ok(())
         }
-        "text" | "mathrm" => match args.as_slice() {
+        // `\underbrace{content}_{label}` parses as an ordinary subscript
+        // attachment on `\underbrace{content}` (confirmed via the parser
+        // directly) — so `\underbrace` itself only needs to speak its
+        // content, same as `\text`; the existing sub/sup attach handling
+        // in `speak_attach` picks up `_{label}` automatically ("sub
+        // label"), with no separate handling needed here.
+        "text" | "mathrm" | "mathsf" | "underbrace" => match args.as_slice() {
             [content] => speak_children(content, out),
             other => bail!("\\{name} expects 1 argument, found {}", other.len()),
         },
-        // `\red`/`\blue` (bare color shorthand) aren't registered with an
-        // argument in `mitex_parser`'s default command spec, unlike
-        // `\textcolor{color}{body}` below — they parse as a bare 0-arg
-        // command with the following `{X}` as a separate sibling group,
-        // not `\red`'s `ClauseArgument`. So there's nothing to do here but
-        // contribute no words; that sibling `{X}` group already speaks its
-        // own content normally via the generic `ItemCurly` handling in
-        // `speak_node`, which is exactly "keep the content, drop the
-        // color" — color is a visual cue with no bearing on how the math
-        // reads aloud.
-        "red" | "blue" => Ok(()),
+        "mathbb" => match args.as_slice() {
+            // Blackboard-bold almost always names a standard number set in
+            // practice — spelling those out ("the real numbers") carries
+            // real meaning that just speaking the bare letter wouldn't.
+            // Anything else falls back to speaking the content plainly,
+            // same as `\mathrm`.
+            [content] => match number_set_name(content) {
+                Some(name) => {
+                    push_word(out, name);
+                    Ok(())
+                }
+                None => speak_children(content, out),
+            },
+            other => bail!("\\mathbb expects 1 argument, found {}", other.len()),
+        },
+        // `\{`/`\}` — LaTeX's escaped literal brace, used for set notation
+        // (`\{0, 1, 2\}`). Each is its own bare command (no argument),
+        // sitting as a sibling next to its content rather than wrapping
+        // it, unlike a bare `{...}` group — but the same "silent
+        // grouping" treatment applies: the braces themselves aren't
+        // spoken, same as `TokenLBrace`/`TokenRBrace` for a plain group.
+        "{" | "}" => Ok(()),
+        "leftarrow" => {
+            // Context this vocabulary was built against is algorithmic
+            // assignment (`\hat{X} \leftarrow \text{DFT}(...)`), not a
+            // mathematical limit/mapping arrow — "gets" is how that's
+            // actually read aloud.
+            push_word(out, "gets");
+            Ok(())
+        }
+        "not" => match args.as_slice() {
+            // `\not` negates whatever single command follows it
+            // (`\not\equiv`, `\not\in`, ...) — recognized relations get a
+            // natural negated phrase; anything else falls back to a
+            // literal "not" prefix, which reads correctly if awkwardly
+            // ("not is equivalent to") rather than failing outright.
+            [content] => match negated_relation_word(content) {
+                Some(word) => {
+                    push_word(out, word);
+                    Ok(())
+                }
+                None => {
+                    push_word(out, "not");
+                    speak_children(content, out)
+                }
+            },
+            other => bail!("\\not expects 1 argument, found {}", other.len()),
+        },
+        "overline" => match args.as_slice() {
+            // The DSP/signal-processing usage this vocabulary targets
+            // (e.g. `\overline{X[N-m]}`) is consistently complex
+            // conjugation, not the other common meanings (an average, a
+            // repeating decimal) — picking the one actually seen rather
+            // than a vaguer "overline of X" that wouldn't convey meaning.
+            [content] => {
+                push_word(out, "the complex conjugate of");
+                speak_children(content, out)
+            }
+            other => bail!("\\overline expects 1 argument, found {}", other.len()),
+        },
+        "hat" => match args.as_slice() {
+            // Postfix, unlike `\overline`/`\sqrt` — "x hat" is how this is
+            // actually said, not "hat of x".
+            [content] => {
+                speak_children(content, out)?;
+                push_word(out, "hat");
+                Ok(())
+            }
+            other => bail!("\\hat expects 1 argument, found {}", other.len()),
+        },
+        // Pure spacing commands — genuinely no argument, no bearing on how
+        // the surrounding math sounds.
+        "quad" | ";" => Ok(()),
+        // Unlike `\quad`/`\;`, `\displaystyle` is greedy — it consumes
+        // everything after it up to the end of its group as one
+        // `ClauseArgument` (confirmed: `a \displaystyle b` parses with
+        // "b" as `\displaystyle`'s own argument, not a separate sibling).
+        // A plain no-op here would silently swallow that content instead
+        // of just ignoring the formatting hint.
+        "displaystyle" => match args.as_slice() {
+            [content] => speak_children(content, out),
+            [] => Ok(()),
+            other => bail!("\\displaystyle expects 0 or 1 arguments, found {}", other.len()),
+        },
         "textcolor" => match args.as_slice() {
             // First argument is the color name/spec — ignored, same reason
             // as `\red`/`\blue` above.
@@ -475,6 +590,21 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             [_content] => Ok(()),
             other => bail!("\\{name} expects 1 argument, found {}", other.len()),
         },
+        _ if is_color_command(name) => {
+            // A bare color shorthand (`\red{X}`, `\darkblue{X}`, ...) —
+            // not standard LaTeX/xcolor, but a common author convention,
+            // and not registered with an argument in `mitex_parser`'s
+            // default command spec (unlike `\textcolor{color}{body}`
+            // above), so it parses as a bare 0-arg command with the
+            // following `{X}` as a separate sibling group, not this
+            // command's own `ClauseArgument`. So there's nothing to do
+            // here but contribute no words; that sibling `{X}` group
+            // already speaks its own content normally via the generic
+            // `ItemCurly` handling in `speak_node` — exactly "keep the
+            // content, drop the color", since color is a visual cue with
+            // no bearing on how the math reads aloud.
+            Ok(())
+        }
         _ => {
             if let Some(word) = symbol_word(name) {
                 push_word(out, word);
@@ -483,6 +613,80 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
                 bail!("unsupported command: \\{name}")
             }
         }
+    }
+}
+
+/// True for a bare color-shorthand command name — `red`, `darkblue`,
+/// `lightgray`, etc. Matches xcolor's base palette (the same list
+/// `math-render`'s color map supports) with an optional `dark`/`light`
+/// prefix, since author documents commonly define exactly those
+/// shorthand macros (`\darkblue{...}` etc.) even though they aren't
+/// standard LaTeX commands themselves.
+fn is_color_command(name: &str) -> bool {
+    const BASE_COLORS: &[&str] = &[
+        "red", "green", "blue", "cyan", "magenta", "yellow", "black", "white", "gray", "grey",
+        "brown", "orange", "pink", "purple", "teal", "olive",
+    ];
+    let stripped = name.strip_prefix("dark").or_else(|| name.strip_prefix("light")).unwrap_or(name);
+    BASE_COLORS.contains(&stripped)
+}
+
+/// The spoken name of a standard number set, for `\mathbb{X}` where `X` is
+/// exactly one of the conventional letters (`R` -> "the real numbers", ...)
+/// — `None` for anything else, so the caller falls back to speaking the
+/// bare content.
+fn number_set_name(content: &SyntaxNode) -> Option<&'static str> {
+    let children: Vec<Element> = content.children_with_tokens().collect();
+    let [Element::Node(curly)] = children.as_slice() else { return None };
+    if curly.kind() != ItemCurly {
+        return None;
+    }
+    let inner: Vec<Element> = curly
+        .children_with_tokens()
+        .filter(|e| !matches!(e, NodeOrToken::Token(t) if t.kind() == TokenLBrace || t.kind() == TokenRBrace))
+        .collect();
+    let [Element::Node(text)] = inner.as_slice() else { return None };
+    if text.kind() != ItemText {
+        return None;
+    }
+    let mut toks = text.children_with_tokens().filter_map(|e| e.into_token());
+    let only = toks.next()?;
+    if toks.next().is_some() || only.kind() != TokenWord {
+        return None;
+    }
+    match only.text() {
+        "R" => Some("the real numbers"),
+        "C" => Some("the complex numbers"),
+        "N" => Some("the natural numbers"),
+        "Z" => Some("the integers"),
+        "Q" => Some("the rational numbers"),
+        _ => None,
+    }
+}
+
+/// The natural negated phrase for `\not X`, where `X` (`content`) is
+/// exactly one bare, argument-less command — `\not\equiv` -> "is not
+/// equivalent to", etc. `None` for anything else (a non-command argument,
+/// or a command `\not` doesn't have a specific phrase for), so the caller
+/// falls back to a literal "not" prefix.
+fn negated_relation_word(content: &SyntaxNode) -> Option<&'static str> {
+    let children: Vec<Element> = content.children_with_tokens().collect();
+    let [Element::Node(cmd)] = children.as_slice() else { return None };
+    if cmd.kind() != ItemCmd {
+        return None;
+    }
+    let name_tok = cmd
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == ClauseCommandName)?;
+    match name_tok.text().trim_start_matches('\\') {
+        "equiv" => Some("is not equivalent to"),
+        "in" => Some("is not an element of"),
+        "leq" | "le" => Some("is not less than or equal to"),
+        "geq" | "ge" => Some("is not greater than or equal to"),
+        "propto" => Some("is not proportional to"),
+        "perp" => Some("is not perpendicular to"),
+        _ => None,
     }
 }
 
@@ -530,6 +734,22 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "times" => "times",
         "cdot" => "times",
         "pm" => "plus or minus",
+        "Delta" => "delta",
+        "ell" => "ell",
+        "sharp" => "sharp",
+        "angle" => "angle",
+        "equiv" => "is equivalent to",
+        "perp" => "is perpendicular to",
+        "mod" => "mod",
+        "in" => "is an element of",
+        "notin" => "is not an element of",
+        "mid" => "such that",
+        "rightarrow" | "to" => "goes to",
+        "Rightarrow" => "implies",
+        "Leftarrow" => "is implied by",
+        "Leftrightarrow" => "if and only if",
+        "lfloor" => "the floor of",
+        "rfloor" => "",
         "sum" => "the sum of",
         "prod" => "the product of",
         "int" => "the integral of",
@@ -637,7 +857,7 @@ mod tests {
 
     #[test]
     fn plain_grouping_parens_no_of() {
-        assert_eq!(speak("(a+b)").unwrap(), "a+b");
+        assert_eq!(speak("(a+b)").unwrap(), "a plus b");
     }
 
     #[test]
@@ -670,8 +890,8 @@ mod tests {
 
     #[test]
     fn color_commands_speak_only_their_content() {
-        assert_eq!(speak(r"\red{x} + \blue{y}").unwrap(), "x + y");
-        assert_eq!(speak(r"\textcolor{red}{x} + y").unwrap(), "x + y");
+        assert_eq!(speak(r"\red{x} + \blue{y}").unwrap(), "x plus y");
+        assert_eq!(speak(r"\textcolor{red}{x} + y").unwrap(), "x plus y");
     }
 
     // The motivating real-world case: colored, canceled units in a
@@ -688,6 +908,23 @@ mod tests {
         assert_eq!(speak("N-1").unwrap(), "N minus 1");
         assert_eq!(speak("5-3").unwrap(), "5 minus 3");
         assert_eq!(speak(r"0, 1, 2, \dots, N-1").unwrap(), "0, 1, 2, dot dot dot, N minus 1");
+    }
+
+    #[test]
+    fn plus_sign_spoken_spaced_or_glued() {
+        assert_eq!(speak("t + t_0").unwrap(), "t plus t sub 0");
+        assert_eq!(speak("t+t_0").unwrap(), "t plus t sub 0");
+    }
+
+    // The real reported case: repeated periodicity equation with `+`
+    // between the shifted-time terms.
+    #[test]
+    fn periodicity_equation_speaks_plus() {
+        assert_eq!(
+            speak(r"x(t) = x(t + t_0) = x(t + 2\cdot t_0) = x(t + 3\cdot t_0) = \dots").unwrap(),
+            "x of t equals x of t plus t sub 0 equals x of t plus 2 times t sub 0 \
+             equals x of t plus 3 times t sub 0 equals dot dot dot"
+        );
     }
 
     #[test]
@@ -720,13 +957,92 @@ mod tests {
         assert_eq!(speak(r"\left[\frac{\text{W}}{\text{m}^2}\right]").unwrap(), "W over m squared");
         // Same function-application/grouping rules as bare `(`/`[` apply.
         assert_eq!(speak(r"x\left(t\right)").unwrap(), "x of t");
-        assert_eq!(speak(r"\left(a+b\right)").unwrap(), "a+b");
+        assert_eq!(speak(r"\left(a+b\right)").unwrap(), "a plus b");
         assert_eq!(speak(r"\left[a, b\right]").unwrap(), "a, b");
     }
 
     #[test]
     fn proportional_to() {
         assert_eq!(speak(r"I \propto p^2").unwrap(), "I is proportional to p squared");
+    }
+
+    #[test]
+    fn generalized_color_commands() {
+        assert_eq!(speak(r"\purple{x}").unwrap(), "x");
+        assert_eq!(speak(r"\darkblue{y}").unwrap(), "y");
+        assert_eq!(speak(r"\magenta{z}").unwrap(), "z");
+        assert_eq!(speak(r"\green{a} \cyan{b}").unwrap(), "a b");
+        // Not a recognized color name — still rejected, not guessed at.
+        assert!(speak(r"\notacolor{x}").is_err());
+    }
+
+    #[test]
+    fn overline_and_hat() {
+        assert_eq!(speak(r"\overline{X[N-m]}").unwrap(), "the complex conjugate of X at index N minus m");
+        assert_eq!(speak(r"\hat{x}").unwrap(), "x hat");
+    }
+
+    #[test]
+    fn spacing_commands_are_silent() {
+        assert_eq!(speak(r"a \quad b").unwrap(), "a b");
+        assert_eq!(speak(r"a \; b").unwrap(), "a b");
+        assert_eq!(speak(r"a \displaystyle b").unwrap(), "a b");
+    }
+
+    #[test]
+    fn additional_symbols() {
+        assert_eq!(speak(r"d \in N").unwrap(), "d is an element of N");
+        assert_eq!(speak(r"m \notin S").unwrap(), "m is not an element of S");
+        assert_eq!(speak(r"\theta \rightarrow \theta + \phi").unwrap(), "theta goes to theta plus phi");
+        assert_eq!(speak(r"a \equiv b \mod n").unwrap(), "a is equivalent to b mod n");
+        assert_eq!(speak(r"\Delta").unwrap(), "delta");
+        assert_eq!(speak(r"\ell").unwrap(), "ell");
+        assert_eq!(speak(r"\angle").unwrap(), "angle");
+        assert_eq!(speak(r"a \perp b").unwrap(), "a is perpendicular to b");
+        assert_eq!(speak(r"\lfloor x \rfloor").unwrap(), "the floor of x");
+    }
+
+    #[test]
+    fn prime_notation() {
+        assert_eq!(speak("f'").unwrap(), "f prime");
+        assert_eq!(speak("N' < N").unwrap(), "N prime less than N");
+        assert_eq!(speak("n''").unwrap(), "n double prime");
+        assert_eq!(speak("n'''").unwrap(), "n triple prime");
+        // Sub/superscript still resolve normally alongside a prime.
+        assert_eq!(speak("f'_s").unwrap(), "f sub s prime");
+    }
+
+    #[test]
+    fn escaped_set_braces_are_silent_grouping() {
+        assert_eq!(speak(r"\{0, 1, 2\}").unwrap(), "0, 1, 2");
+        assert_eq!(speak(r"m \notin \{0, N\}").unwrap(), "m is not an element of 0, N");
+    }
+
+    #[test]
+    fn mathbb_number_sets() {
+        assert_eq!(speak(r"z \in \mathbb{C}").unwrap(), "z is an element of the complex numbers");
+        assert_eq!(speak(r"\theta \in \mathbb{R}").unwrap(), "theta is an element of the real numbers");
+        assert_eq!(speak(r"d \in \mathbb{N}").unwrap(), "d is an element of the natural numbers");
+        // Not one of the conventional letters — falls back to plain content.
+        assert_eq!(speak(r"\mathbb{X}").unwrap(), "X");
+    }
+
+    #[test]
+    fn leftarrow_is_assignment() {
+        assert_eq!(speak(r"X \leftarrow \text{DFT}(x)").unwrap(), "X gets DFT of x");
+    }
+
+    #[test]
+    fn not_negates_known_relations() {
+        assert_eq!(speak(r"\theta \not\equiv 0").unwrap(), "theta is not equivalent to 0");
+        // Falls back to a literal "not" prefix for a relation without a
+        // specific negated phrase, rather than failing outright.
+        assert_eq!(speak(r"a \not\propto b").unwrap(), "a is not proportional to b");
+    }
+
+    #[test]
+    fn underbrace_speaks_content() {
+        assert_eq!(speak(r"\underbrace{0, 0}").unwrap(), "0, 0");
     }
 
     #[test]
