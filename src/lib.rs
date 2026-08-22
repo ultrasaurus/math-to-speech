@@ -142,7 +142,18 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
         }
 
         speak_element(&elements[i], out)?;
-        if !matches!(&elements[i], NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment)) {
+        // Tokens that `speak_element` speaks as nothing (see its match arms
+        // below) must not count as "just spoke something" either, or the
+        // next real content wrongly triggers `(`/`[`'s "of"/"at index"
+        // wording — e.g. `{(x-2)}`'s opening `{` was marking `has_content`
+        // before the `(` it precedes, producing "of x minus 2".
+        if !matches!(
+            &elements[i],
+            NodeOrToken::Token(t) if matches!(
+                t.kind(),
+                TokenWhiteSpace | TokenLineBreak | TokenComment | TokenTilde | TokenAmpersand | TokenLBrace | TokenRBrace
+            )
+        ) {
             has_content = true;
         }
         i += 1;
@@ -1359,5 +1370,10 @@ mod tests {
     #[test]
     fn plain_closed_bracket_pair_is_still_silent_grouping() {
         assert_eq!(speak(r"[a, b]").unwrap(), "a, b");
+    }
+
+    #[test]
+    fn braces_dont_trigger_of_on_the_paren_they_precede() {
+        assert_eq!(speak(r"\frac{1}{(x-2)}").unwrap(), "1 over x minus 2");
     }
 }
