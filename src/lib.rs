@@ -66,10 +66,10 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
             let mut depth = 1;
             let mut j = i + 1;
             while j < elements.len() {
-                if let NodeOrToken::Token(t) = &elements[j] {
-                    if t.kind() == open_kind {
+                if let Some(kind) = element_bracket_kind(&elements[j]) {
+                    if kind == open_kind {
                         depth += 1;
-                    } else if t.kind() == close_kind {
+                    } else if kind == close_kind {
                         depth -= 1;
                         if depth == 0 {
                             break;
@@ -78,16 +78,47 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
                 }
                 j += 1;
             }
-            if j >= elements.len() {
-                bail!("unmatched bracket in math expression");
+            if j < elements.len() {
+                if has_content {
+                    push_word(out, word);
+                }
+                speak_sequence(&elements[i + 1..j], out)?;
+                if let NodeOrToken::Node(n) = &elements[j] {
+                    speak_attach_scripts(&parse_attach(n)?, out)?;
+                }
+                has_content = true;
+                i = j + 1;
+                continue;
             }
-            if has_content {
-                push_word(out, word);
+
+            // No same-kind close found — try interval notation, where the
+            // closing delimiter is deliberately the *other* bracket kind
+            // (`[a, b)` for a half-open interval). Track combined depth
+            // across both bracket families to find the real close, then
+            // require a top-level comma splitting the two bounds; anything
+            // short of that isn't an interval, just malformed math.
+            if let Some((close_kind, j)) = find_interval_close(&elements[i + 1..]).map(|(k, j)| (k, j + i + 1)) {
+                // `mitex_parser` groups a run of words/commas/whitespace
+                // into one `ItemText` node (`a, b` -> a single `ItemText`,
+                // not flat sibling tokens) — flatten that back out so the
+                // comma between the two bounds is visible to
+                // `top_level_comma`.
+                let inner = flatten_text_nodes(&elements[i + 1..j]);
+                let Some(comma_pos) = top_level_comma(&inner) else {
+                    bail!("unmatched bracket in math expression");
+                };
+                push_word(out, "the interval from");
+                speak_sequence(&inner[..comma_pos], out)?;
+                push_word(out, if open_kind == TokenLBracket { "inclusive," } else { "exclusive," });
+                push_word(out, "to");
+                speak_sequence(&inner[comma_pos + 1..], out)?;
+                push_word(out, if close_kind == TokenRBracket { "inclusive" } else { "exclusive" });
+                has_content = true;
+                i = j + 1;
+                continue;
             }
-            speak_sequence(&elements[i + 1..j], out)?;
-            has_content = true;
-            i = j + 1;
-            continue;
+
+            bail!("unmatched bracket in math expression");
         }
 
         // `\left(...\right)` / `\left[...\right]` — mitex_parser groups
@@ -314,6 +345,15 @@ struct Attach {
 fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
     let attach = parse_attach(node)?;
     speak_children(&attach.base, out)?;
+    speak_attach_scripts(&attach, out)
+}
+
+/// The sub/superscript/prime portion of an `ItemAttachComponent`, without
+/// speaking its base — split out from `speak_attach` so a bracket token
+/// wrapped in an attach node (`(x-2)^2` gives the closing `)` a `^2`
+/// attachment, per `speak_sequence`'s bracket scan) can still speak the
+/// script even though the bracket itself is silent/implied.
+fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
     if let Some(sup) = &attach.sup {
         if let Some(suffix) = ordinal_suffix(sup) {
             // No `push_word` here — an ordinal suffix attaches directly to
@@ -439,6 +479,92 @@ fn simple_power_word(sup: &[Element]) -> Option<&'static str> {
         "3" => Some("cubed"),
         _ => None,
     }
+}
+
+/// The bracket kind `e` represents, if any — either a plain bracket token,
+/// or (see `speak_sequence`'s bracket scan) a closing bracket that
+/// `mitex_parser` wrapped in an `ItemAttachComponent` because it carries a
+/// sub/superscript (`(x-2)^2` attaches `^2` to the `)`, not to the whole
+/// group). Ignores whatever script the attach carries — the caller decides
+/// separately whether to speak it.
+fn element_bracket_kind(e: &Element) -> Option<mitex_parser::syntax::SyntaxKind> {
+    match e {
+        NodeOrToken::Token(t) if matches!(t.kind(), TokenLParen | TokenRParen | TokenLBracket | TokenRBracket) => {
+            Some(t.kind())
+        }
+        NodeOrToken::Node(n) if n.kind() == ItemAttachComponent => {
+            let attach = parse_attach(n).ok()?;
+            let tokens: Vec<_> = attach.base.children_with_tokens().filter_map(|e| e.into_token()).collect();
+            let [only] = tokens.as_slice() else { return None };
+            matches!(only.kind(), TokenLParen | TokenRParen | TokenLBracket | TokenRBracket).then(|| only.kind())
+        }
+        _ => None,
+    }
+}
+
+/// Scans `elements` (the content just after an already-consumed opening
+/// bracket) for the closing bracket of a half-open/half-closed interval —
+/// any bracket kind, not just the matching one, found once nested brackets
+/// have all closed. Returns the close token's kind and its index within
+/// `elements`.
+fn find_interval_close(elements: &[Element]) -> Option<(mitex_parser::syntax::SyntaxKind, usize)> {
+    let mut depth = 0i32;
+    for (idx, e) in elements.iter().enumerate() {
+        let Some(kind) = element_bracket_kind(e) else { continue };
+        match kind {
+            TokenLParen | TokenLBracket => depth += 1,
+            TokenRParen | TokenRBracket => {
+                if depth == 0 {
+                    return Some((kind, idx));
+                }
+                depth -= 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+    None
+}
+
+/// Expands any top-level `ItemText` node in `elements` into its own child
+/// tokens — `mitex_parser` merges a run of words/commas/whitespace into one
+/// `ItemText`, so a comma between two interval bounds isn't a flat sibling
+/// token until this runs.
+fn flatten_text_nodes(elements: &[Element]) -> Vec<Element> {
+    let mut out = Vec::with_capacity(elements.len());
+    for e in elements {
+        if let NodeOrToken::Node(n) = e {
+            if n.kind() == ItemText {
+                out.extend(n.children_with_tokens());
+                continue;
+            }
+        }
+        out.push(e.clone());
+    }
+    out
+}
+
+/// The index of the first top-level comma in `elements` (not nested inside
+/// its own bracket pair) — splits an interval's two bounds.
+fn top_level_comma(elements: &[Element]) -> Option<usize> {
+    let mut depth = 0i32;
+    for (idx, e) in elements.iter().enumerate() {
+        if let Some(kind) = element_bracket_kind(e) {
+            match kind {
+                TokenLParen | TokenLBracket => depth += 1,
+                TokenRParen | TokenRBracket => depth -= 1,
+                _ => unreachable!(),
+            }
+            continue;
+        }
+        if depth == 0 {
+            if let NodeOrToken::Token(t) = e {
+                if t.kind() == TokenComma {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `ItemAttachComponent` nests: `x_1^2` is an attach-of-an-attach, with the
@@ -791,6 +917,10 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "propto" => "is proportional to",
         "times" => "times",
         "cdot" => "times",
+        "sim" => "on the order of",
+        "ll" => "is much less than",
+        "gg" => "is much greater than",
+        "circ" => "circle",
         "pm" => "plus or minus",
         "Delta" => "delta",
         "ell" => "ell",
@@ -1163,5 +1293,71 @@ mod tests {
     #[test]
     fn unbraced_ordinal_only_takes_one_character() {
         assert_eq!(speak("n^th").unwrap(), "n to the t h");
+    }
+
+    #[test]
+    fn on_the_order_of_symbol() {
+        assert_eq!(speak(r"\sim N^2").unwrap(), "on the order of N squared");
+    }
+
+    #[test]
+    fn much_less_than_symbol() {
+        assert_eq!(speak(r"N \ll N^2").unwrap(), "N is much less than N squared");
+    }
+
+    #[test]
+    fn much_greater_than_symbol() {
+        assert_eq!(speak(r"N \gg 1").unwrap(), "N is much greater than 1");
+    }
+
+    #[test]
+    fn circle_symbol() {
+        assert_eq!(speak(r"\circ").unwrap(), "circle");
+    }
+
+    #[test]
+    fn degree_symbol_still_takes_priority_over_circle_word() {
+        assert_eq!(speak(r"360^\circ").unwrap(), "360 degrees");
+    }
+
+    #[test]
+    fn closing_bracket_with_exponent() {
+        assert_eq!(speak(r"(x-2)^2").unwrap(), "x minus 2 squared");
+    }
+
+    #[test]
+    fn closing_index_bracket_with_exponent() {
+        assert_eq!(speak(r"x[n]^2").unwrap(), "x at index n squared");
+    }
+
+    #[test]
+    fn half_open_interval_bracket_paren() {
+        assert_eq!(speak(r"[a, b)").unwrap(), "the interval from a inclusive, to b exclusive");
+    }
+
+    #[test]
+    fn half_open_interval_paren_bracket() {
+        assert_eq!(speak(r"(a, b]").unwrap(), "the interval from a exclusive, to b inclusive");
+    }
+
+    #[test]
+    fn half_open_interval_with_signed_bounds() {
+        assert_eq!(
+            speak(r"[-\pi, +\pi)").unwrap(),
+            "the interval from negative pi inclusive, to plus pi exclusive"
+        );
+    }
+
+    #[test]
+    fn interval_notation_inside_larger_expression() {
+        assert_eq!(
+            speak(r"x \in [a, b)").unwrap(),
+            "x is an element of the interval from a inclusive, to b exclusive"
+        );
+    }
+
+    #[test]
+    fn plain_closed_bracket_pair_is_still_silent_grouping() {
+        assert_eq!(speak(r"[a, b]").unwrap(), "a, b");
     }
 }
