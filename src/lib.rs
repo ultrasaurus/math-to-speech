@@ -39,9 +39,17 @@ fn push_word(out: &mut String, word: &str) {
 /// "sub X" / "to the X" by the caller.
 type Element = NodeOrToken<SyntaxNode, mitex_parser::syntax::SyntaxToken>;
 
+/// Speaks `node`'s direct children as a fresh sequence — used for every
+/// subexpression that starts its own "has anything been spoken yet"
+/// context (a `{...}` group, a command argument, environment content,
+/// etc.). The one context that must *not* start fresh is an attach node's
+/// base (see `speak_attach`), which inherits the enclosing sequence's
+/// `has_content` directly via `speak_sequence` instead of going through
+/// this wrapper.
 fn speak_children(node: &SyntaxNode, out: &mut String) -> Result<()> {
     let elements: Vec<Element> = node.children_with_tokens().collect();
-    speak_sequence(&elements, out)
+    let mut has_content = false;
+    speak_sequence(&elements, out, &mut has_content)
 }
 
 /// Walks one flat sibling list (a node's direct children), phrasing
@@ -53,8 +61,15 @@ fn speak_children(node: &SyntaxNode, out: &mut String) -> Result<()> {
 /// aren't grouped into their own AST node by `mitex_parser` — they're
 /// plain sibling tokens next to whatever's inside them — so this scan
 /// tracks bracket depth itself to find each matching close.
-fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
-    let mut has_content = false;
+///
+/// `has_content` is whether anything has already been spoken in *this*
+/// sequence — normally starts `false` (via `speak_children`), but an
+/// attach node's base inherits the caller's current value instead (see
+/// `speak_attach`), since mitex can glue a mid-sequence `-` onto the next
+/// operand's leading token (`p_1-p_2` parses `-p` as one word, the base of
+/// the second `_2` attach) and word-local position alone can't tell that
+/// apart from a truly leading `-`.
+fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool) -> Result<()> {
     let mut i = 0;
     while i < elements.len() {
         let bracket = match &elements[i] {
@@ -79,14 +94,15 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
                 j += 1;
             }
             if j < elements.len() {
-                if has_content {
+                if *has_content {
                     push_word(out, word);
                 }
-                speak_sequence(&elements[i + 1..j], out)?;
+                let mut inner_has_content = false;
+                speak_sequence(&elements[i + 1..j], out, &mut inner_has_content)?;
                 if let NodeOrToken::Node(n) = &elements[j] {
                     speak_attach_scripts(&parse_attach(n)?, out)?;
                 }
-                has_content = true;
+                *has_content = true;
                 i = j + 1;
                 continue;
             }
@@ -108,12 +124,14 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
                     bail!("unmatched bracket in math expression");
                 };
                 push_word(out, "the interval from");
-                speak_sequence(&inner[..comma_pos], out)?;
+                let mut lower_has_content = false;
+                speak_sequence(&inner[..comma_pos], out, &mut lower_has_content)?;
                 push_word(out, if open_kind == TokenLBracket { "inclusive," } else { "exclusive," });
                 push_word(out, "to");
-                speak_sequence(&inner[comma_pos + 1..], out)?;
+                let mut upper_has_content = false;
+                speak_sequence(&inner[comma_pos + 1..], out, &mut upper_has_content)?;
                 push_word(out, if close_kind == TokenRBracket { "inclusive" } else { "exclusive" });
-                has_content = true;
+                *has_content = true;
                 i = j + 1;
                 continue;
             }
@@ -129,19 +147,20 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
         if let NodeOrToken::Node(node) = &elements[i] {
             if node.kind() == ItemLR {
                 let (word, inner) = left_right_group(node)?;
-                if has_content {
+                if *has_content {
                     if let Some(word) = word {
                         push_word(out, word);
                     }
                 }
-                speak_sequence(&inner, out)?;
-                has_content = true;
+                let mut inner_has_content = false;
+                speak_sequence(&inner, out, &mut inner_has_content)?;
+                *has_content = true;
                 i += 1;
                 continue;
             }
         }
 
-        speak_element(&elements[i], out)?;
+        speak_element(&elements[i], out, *has_content)?;
         // Tokens that `speak_element` speaks as nothing (see its match arms
         // below) must not count as "just spoke something" either, or the
         // next real content wrongly triggers `(`/`[`'s "of"/"at index"
@@ -154,7 +173,7 @@ fn speak_sequence(elements: &[Element], out: &mut String) -> Result<()> {
                 TokenWhiteSpace | TokenLineBreak | TokenComment | TokenTilde | TokenAmpersand | TokenLBrace | TokenRBrace
             )
         ) {
-            has_content = true;
+            *has_content = true;
         }
         i += 1;
     }
@@ -203,7 +222,17 @@ fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Elem
 /// literal character, some TTS engines (confirmed: misaki/espeak, and the
 /// vibe/F5 model) silently produce no phonemes for them at all, dropping
 /// them from the audio rather than mispronouncing them.
-fn speak_operator_word(word: &str) -> Option<String> {
+///
+/// `out_has_content` is `speak_sequence`'s own `has_content` for the
+/// current sequence being spoken (not just "is `out` non-empty" — `out`
+/// often already holds unrelated preceding text, e.g. "the interval from"
+/// before a bound's own leading `-\pi`, which must still read "negative")
+/// — a `-` at index 0 of *this word* isn't necessarily leading its
+/// sequence: `p_1-p_2` glues the second operand's `-` onto `p` (mitex
+/// splits it as `-p`, not a separate `-` token) even though `p_1` was
+/// already spoken earlier in the same sequence, so word-local position
+/// alone would wrongly call it "negative" instead of "minus".
+fn speak_operator_word(word: &str, out_has_content: bool) -> Option<String> {
     if !word.contains(['-', '+', '=', '<', '>']) {
         return None;
     }
@@ -225,7 +254,7 @@ fn speak_operator_word(word: &str) -> Option<String> {
 
     for (i, &c) in chars.iter().enumerate() {
         let op_word = match c {
-            '-' if i == 0 => Some("negative"),
+            '-' if i == 0 && !out_has_content => Some("negative"),
             '-' => Some("minus"),
             '+' => Some("plus"),
             '=' => Some("equals"),
@@ -244,13 +273,30 @@ fn speak_operator_word(word: &str) -> Option<String> {
     Some(phrase)
 }
 
-fn speak_element(element: &Element, out: &mut String) -> Result<()> {
+fn speak_element(element: &Element, out: &mut String, has_content: bool) -> Result<()> {
     match element {
-        NodeOrToken::Node(node) => speak_node(node, out),
+        NodeOrToken::Node(node) => speak_node(node, out, has_content),
         NodeOrToken::Token(tok) => match tok.kind() {
             TokenWhiteSpace | TokenLineBreak | TokenComment => Ok(()),
             TokenWord => {
-                if let Some(phrase) = speak_operator_word(tok.text()) {
+                // A bare standalone `-` (nothing glued to it at all, e.g.
+                // `N - 1`/`a - b - c` — mitex only produces this exact
+                // shape when the `-` is a genuine sibling token in *this*
+                // same sequence, never as a leftover fragment of some
+                // other operand) is safe to resolve from this sequence's
+                // own `has_content`: nothing yet means a leading negative
+                // sign, anything already spoken here means subtraction.
+                //
+                // Any other word stays context-free: a self-contained
+                // glued word like `-1` right after `=`/`(`/`,` is
+                // unambiguous on its own regardless of what was spoken
+                // earlier — `x = -1` must stay "negative 1", not "minus
+                // 1", even though `has_content` is true by this point.
+                // (`speak_attach` special-cases the one remaining
+                // ambiguous glued shape, `-p` as an attach's base, itself
+                // — see its comment.)
+                let context = tok.text() == "-" && has_content;
+                if let Some(phrase) = speak_operator_word(tok.text(), context) {
                     push_word(out, &phrase);
                 } else {
                     push_word(out, tok.text());
@@ -289,13 +335,13 @@ fn speak_element(element: &Element, out: &mut String) -> Result<()> {
     }
 }
 
-fn speak_node(node: &SyntaxNode, out: &mut String) -> Result<()> {
+fn speak_node(node: &SyntaxNode, out: &mut String, has_content: bool) -> Result<()> {
     match node.kind() {
         ScopeRoot | ItemFormula => speak_children(node, out),
         ItemCurly => speak_children(node, out),
         ItemText => speak_children(node, out),
         ItemCmd => speak_cmd(node, out),
-        ItemAttachComponent => speak_attach(node, out),
+        ItemAttachComponent => speak_attach(node, out, has_content),
         ItemEnv => speak_env(node, out),
         other => bail!("unsupported math construct: {other:?}"),
     }
@@ -339,7 +385,8 @@ fn speak_env(node: &SyntaxNode, out: &mut String) -> Result<()> {
         .children_with_tokens()
         .filter(|e| !matches!(e, NodeOrToken::Node(n) if n.kind() == ItemBegin || n.kind() == ItemEnd))
         .collect();
-    speak_sequence(&elements, out)
+    let mut has_content = false;
+    speak_sequence(&elements, out, &mut has_content)
 }
 
 struct Attach {
@@ -353,10 +400,67 @@ struct Attach {
     prime_count: usize,
 }
 
-fn speak_attach(node: &SyntaxNode, out: &mut String) -> Result<()> {
+fn speak_attach(node: &SyntaxNode, out: &mut String, has_content: bool) -> Result<()> {
     let attach = parse_attach(node)?;
+
+    // mitex glues a mid-sequence `-` onto the *next* operand's leading
+    // token when that operand becomes an attach's base — `p_1-p_2` parses
+    // `-p` as one word, the base of the second `_2` attach (and `p_1 -
+    // p_2`, spaced, does the same but as a separate `-` token immediately
+    // followed by `p`, both inside one `ItemText`) — so that leading `-`
+    // isn't really "leading its own expression", it's continuing
+    // subtraction from whatever was already spoken (`p_1`). Word-local
+    // position alone can't see that (`speak_operator_word` only looks
+    // within the one glued word), so it's special-cased directly here:
+    // when something was already spoken in the enclosing sequence, strip
+    // the base's own leading `-` and speak "minus" before it instead of
+    // letting the normal path read it as "negative".
+    //
+    // Deliberately narrow — this must NOT become "if has_content, treat
+    // every leading `-` as minus": a self-contained token like `-1` right
+    // after `=`/`(`/`,` (no attach involved at all) is unambiguous on its
+    // own and stays "negative" regardless of prior content (`x = -1`
+    // stays "x equals negative 1", never "minus 1") — see
+    // `speak_element`'s `TokenWord` arm, which always calls
+    // `speak_operator_word` context-free for exactly that reason.
+    if has_content {
+        let flat = flat_base_elements(&attach.base);
+        if let Some((NodeOrToken::Token(first_tok), rest)) = flat.split_first() {
+            if first_tok.kind() == TokenWord {
+                if let Some(after_minus) = first_tok.text().strip_prefix('-') {
+                    push_word(out, "minus");
+                    if !after_minus.is_empty() {
+                        if let Some(phrase) = speak_operator_word(after_minus, false) {
+                            push_word(out, &phrase);
+                        } else {
+                            push_word(out, after_minus);
+                        }
+                    }
+                    let mut rest_has_content = true;
+                    speak_sequence(rest, out, &mut rest_has_content)?;
+                    return speak_attach_scripts(&attach, out);
+                }
+            }
+        }
+    }
+
     speak_children(&attach.base, out)?;
     speak_attach_scripts(&attach, out)
+}
+
+/// The base's real leaf tokens, unwrapping the single `ItemText` wrapper
+/// `mitex_parser` adds around a run of words — `speak_children` would
+/// reach the same tokens by recursing through `speak_node`'s `ItemText`
+/// arm; this does the same unwrap eagerly so `speak_attach` can inspect
+/// the very first leaf token without a full recursive walk.
+fn flat_base_elements(base: &SyntaxNode) -> Vec<Element> {
+    let children: Vec<Element> = base.children_with_tokens().collect();
+    if let [NodeOrToken::Node(n)] = children.as_slice() {
+        if n.kind() == ItemText {
+            return n.children_with_tokens().collect();
+        }
+    }
+    children
 }
 
 /// The sub/superscript/prime portion of an `ItemAttachComponent`, without
@@ -376,12 +480,14 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
             push_word(out, "degrees");
         } else {
             push_word(out, "to the");
-            speak_sequence(sup, out)?;
+            let mut has_content = false;
+            speak_sequence(sup, out, &mut has_content)?;
         }
     }
     if let Some(sub) = &attach.sub {
         push_word(out, "sub");
-        speak_sequence(sub, out)?;
+        let mut has_content = false;
+        speak_sequence(sub, out, &mut has_content)?;
     }
     // `f'` -> "f prime", `f''` -> "f double prime", `f'''` -> "f triple
     // prime" (derivative notation) — higher counts are vanishingly rare in
@@ -1107,6 +1213,50 @@ mod tests {
         assert_eq!(speak("N-1").unwrap(), "N minus 1");
         assert_eq!(speak("5-3").unwrap(), "5 minus 3");
         assert_eq!(speak(r"0, 1, 2, \dots, N-1").unwrap(), "0, 1, 2, dot dot dot, N minus 1");
+    }
+
+    #[test]
+    fn standalone_spaced_minus_between_plain_operands() {
+        assert_eq!(speak("N - 1").unwrap(), "N minus 1");
+        assert_eq!(speak("a - b - c").unwrap(), "a minus b minus c");
+    }
+
+    #[test]
+    fn subtraction_between_subscripted_operands() {
+        // The reported bug: mitex glues the `-` onto the next operand's
+        // base when it's subscripted (`p_1-p_2` -> base `-p` for the
+        // second attach), or splits it into its own token immediately
+        // followed by the base (`p_1 - p_2`, spaced) -- both must read as
+        // subtraction, not a leading negative sign on the second operand.
+        assert_eq!(speak("p_1 - p_2").unwrap(), "p sub 1 minus p sub 2");
+        assert_eq!(speak("p_1-p_2").unwrap(), "p sub 1 minus p sub 2");
+        assert_eq!(speak("z_{m} - z_{k}").unwrap(), "z sub m minus z sub k");
+        assert_eq!(speak("p_1 - p_2 + p_3").unwrap(), "p sub 1 minus p sub 2 plus p sub 3");
+    }
+
+    #[test]
+    fn leading_negative_sign_on_subscripted_operand_unaffected() {
+        assert_eq!(speak("-p_1").unwrap(), "negative p sub 1");
+        assert_eq!(speak("-p_1 - p_2").unwrap(), "negative p sub 1 minus p sub 2");
+    }
+
+    #[test]
+    fn leading_negative_after_relation_stays_negative_not_minus() {
+        // Must NOT regress: `has_content` being true (from "x ="` already
+        // spoken) must not make a self-contained `-1` read as "minus 1".
+        assert_eq!(speak("x = -1").unwrap(), "x equals negative 1");
+    }
+
+    #[test]
+    fn leading_negative_inside_fresh_grouping_contexts() {
+        // Parens/brackets/sqrt/frac/sup content all start a fresh
+        // "has anything been spoken" context, independent of what
+        // preceded the group itself.
+        assert_eq!(speak(r"x(-1)").unwrap(), "x of negative 1");
+        assert_eq!(speak(r"x[-1]").unwrap(), "x at index negative 1");
+        assert_eq!(speak(r"\sqrt{-1}").unwrap(), "the square root of negative 1");
+        assert_eq!(speak(r"\frac{1}{2} - p_1").unwrap(), "1 over 2 minus p sub 1");
+        assert_eq!(speak(r"e^{-1}").unwrap(), "e to the negative 1");
     }
 
     #[test]
