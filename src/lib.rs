@@ -485,9 +485,20 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
         }
     }
     if let Some(sub) = &attach.sub {
-        push_word(out, "sub");
-        let mut has_content = false;
-        speak_sequence(sub, out, &mut has_content)?;
+        if let Some(word) = component_subscript_word(sub) {
+            // `x_\perp`/`x_\parallel` name a *component* of `x` (the
+            // perpendicular/parallel part of a decomposed vector or
+            // signal, common notation in physics/DSP), not a literal
+            // subscript index — spoken as "x perpendicular"/"x parallel"
+            // directly, not "x sub is perpendicular to" (the relation
+            // phrasing `symbol_word` gives `\perp`/`\parallel`
+            // elsewhere, for `a \perp b`-style statements).
+            push_word(out, word);
+        } else {
+            push_word(out, "sub");
+            let mut has_content = false;
+            speak_sequence(sub, out, &mut has_content)?;
+        }
     }
     // `f'` -> "f prime", `f''` -> "f double prime", `f'''` -> "f triple
     // prime" (derivative notation) — higher counts are vanishingly rare in
@@ -560,6 +571,25 @@ fn is_degree_symbol(sup: &[Element]) -> bool {
         return false;
     };
     name_tok.text().trim_start_matches('\\') == "circ"
+}
+
+/// "perpendicular"/"parallel" for a bare `\perp`/`\parallel` subscript
+/// (`x_\perp`, `x_\parallel`) — the vector/signal-decomposition component
+/// notation, not the relation `a \perp b` (`symbol_word` handles that
+/// case, reached via a *sibling* `\perp`, never a subscript). `None` for
+/// anything else, so the caller falls back to plain "sub X".
+fn component_subscript_word(sub: &[Element]) -> Option<&'static str> {
+    let [Element::Node(cmd)] = sub else { return None };
+    if cmd.kind() != ItemCmd {
+        return None;
+    }
+    let name_tok =
+        cmd.children_with_tokens().filter_map(|e| e.into_token()).find(|t| t.kind() == ClauseCommandName)?;
+    match name_tok.text().trim_start_matches('\\') {
+        "perp" => Some("perpendicular"),
+        "parallel" => Some("parallel"),
+        _ => None,
+    }
 }
 
 /// `\text{...}` wrapping a single braced argument — unwraps it to that
@@ -987,6 +1017,7 @@ fn negated_relation_word(content: &SyntaxNode) -> Option<&'static str> {
         "geq" | "ge" => Some("is not greater than or equal to"),
         "propto" => Some("is not proportional to"),
         "perp" => Some("is not perpendicular to"),
+        "parallel" => Some("is not parallel to"),
         _ => None,
     }
 }
@@ -1045,6 +1076,7 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "angle" => "angle",
         "equiv" => "is equivalent to",
         "perp" => "is perpendicular to",
+        "parallel" => "is parallel to",
         "mod" => "mod",
         "in" => "is an element of",
         "notin" => "is not an element of",
@@ -1248,6 +1280,19 @@ mod tests {
     }
 
     #[test]
+    fn perp_and_parallel_component_subscripts_speak_as_bare_words() {
+        // `x_\perp`/`x_\parallel` name a vector/signal decomposition
+        // component ("the perpendicular part of x"), not a literal
+        // subscript index or the `a \perp b` relation -- must not say
+        // "sub" or "is ... to".
+        assert_eq!(speak(r"x_\perp(t)").unwrap(), "x perpendicular of t");
+        assert_eq!(speak(r"x_\perp").unwrap(), "x perpendicular");
+        assert_eq!(speak(r"x_\parallel").unwrap(), "x parallel");
+        // A real numeric/variable subscript is unaffected.
+        assert_eq!(speak(r"x_1").unwrap(), "x sub 1");
+    }
+
+    #[test]
     fn leading_negative_inside_fresh_grouping_contexts() {
         // Parens/brackets/sqrt/frac/sup content all start a fresh
         // "has anything been spoken" context, independent of what
@@ -1354,6 +1399,7 @@ mod tests {
         assert_eq!(speak(r"\ell").unwrap(), "ell");
         assert_eq!(speak(r"\angle").unwrap(), "angle");
         assert_eq!(speak(r"a \perp b").unwrap(), "a is perpendicular to b");
+        assert_eq!(speak(r"a \parallel b").unwrap(), "a is parallel to b");
         assert_eq!(speak(r"\lfloor x \rfloor").unwrap(), "the floor of x");
     }
 
