@@ -94,7 +94,14 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                 j += 1;
             }
             if j < elements.len() {
-                if *has_content {
+                // See the `ItemLR` handling in this same function for why
+                // a connective word immediately before the bracket (`x =
+                // (a+b)`, `V \cdot (...)`) must not trigger the `x(t)`
+                // "of"/"at index" function-application wording.
+                let prev_is_connective = prev_nontrivial_index(elements, i)
+                    .and_then(|k| render_element_alone(&elements[k]).ok())
+                    .is_some_and(|phrase| is_connective_word(&phrase));
+                if *has_content && !prev_is_connective {
                     push_word(out, word);
                 }
                 let mut inner_has_content = false;
@@ -147,10 +154,22 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         if let NodeOrToken::Node(node) = &elements[i] {
             if node.kind() == ItemLR {
                 let (prefix, inner) = left_right_group(node)?;
+                // A connective word (`\cdot`, `+`, `=`, `\leq`, ...) spoken
+                // immediately before this group doesn't count as "an
+                // operand was just spoken" for `IfPreceded` purposes — only
+                // an actual value/expression/function name does. Without
+                // this, `V \cdot (\frac{a}{b})` reads as "V times of a over
+                // b": `\cdot` already set `has_content`, so the grouping
+                // paren wrongly took the `x(t)` "of" phrasing meant for
+                // function application, not "times" followed by a plain
+                // grouped multiplicand.
+                let prev_is_connective = prev_nontrivial_index(elements, i)
+                    .and_then(|j| render_element_alone(&elements[j]).ok())
+                    .is_some_and(|phrase| is_connective_word(&phrase));
                 match prefix {
                     LRPrefix::None => {}
                     LRPrefix::IfPreceded(word) => {
-                        if *has_content {
+                        if *has_content && !prev_is_connective {
                             push_word(out, word);
                         }
                     }
@@ -224,6 +243,49 @@ fn next_nontrivial_index(elements: &[Element], i: usize) -> Option<usize> {
 
 fn is_trivial(element: &Element) -> bool {
     matches!(element, NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
+}
+
+/// True when the rendered phrase of a preceding element *ends with* a
+/// binary operator/relation word (`\cdot` -> "times", a bare `+` ->
+/// "plus", `\leq` -> "less than or equal to", ...) — words that connect
+/// two operands rather than naming one themselves. Checked as a suffix,
+/// not exact equality, because mitex groups a run like `x = ` into one
+/// `ItemText` node/element (`"x equals"`), not separate `x`/`=` siblings —
+/// what matters is only the trailing word(s), i.e. what was *just* spoken
+/// right before the following bracket. Used to tell a genuine operand
+/// from a connective when deciding whether a `(...)`/`[...]` right after
+/// it means function application (see the `ItemLR` handling above).
+fn is_connective_word(phrase: &str) -> bool {
+    const CONNECTIVES: &[&str] = &[
+        "times",
+        "plus",
+        "minus",
+        "negative",
+        "equals",
+        "less than",
+        "greater than",
+        "less than or equal to",
+        "greater than or equal to",
+        "not equal to",
+        "approximately",
+        "is proportional to",
+        "on the order of",
+        "is much less than",
+        "is much greater than",
+        "plus or minus",
+        "is equivalent to",
+        "is perpendicular to",
+        "is parallel to",
+        "mod",
+        "is an element of",
+        "is not an element of",
+        "such that",
+        "goes to",
+        "implies",
+        "is implied by",
+        "if and only if",
+    ];
+    CONNECTIVES.iter().any(|c| phrase == *c || phrase.ends_with(&format!(" {c}")))
 }
 
 /// Renders a single element in a fresh "nothing spoken yet" context,
@@ -1454,6 +1516,16 @@ mod tests {
     #[test]
     fn slash_division_repeated_operand_speaks_anaphorically() {
         assert_eq!(speak("2^{n-1} / 2^{n-1}").unwrap(), "2 to the n minus 1 over itself");
+    }
+
+    #[test]
+    fn cdot_before_grouping_parens_is_not_function_application() {
+        assert_eq!(speak(r"V \cdot \left(\frac{a}{b}\right)").unwrap(), "V times a over b");
+    }
+
+    #[test]
+    fn equals_before_grouping_parens_is_not_function_application() {
+        assert_eq!(speak(r"x = (a+b)").unwrap(), "x equals a plus b");
     }
 
     #[test]
