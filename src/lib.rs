@@ -139,18 +139,22 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             bail!("unmatched bracket in math expression");
         }
 
-        // `\left(...\right)` / `\left[...\right]` — mitex_parser groups
-        // these into one `ItemLR` node (unlike bare `(`/`[`, which are
-        // flat sibling tokens, handled above), but the same "of"/"at
-        // index"/plain-grouping decision applies based on the opening
-        // delimiter and whatever preceded it.
+        // `\left(...\right)` / `\left[...\right]` / `\left|...\right|` —
+        // mitex_parser groups these into one `ItemLR` node (unlike bare
+        // `(`/`[`, which are flat sibling tokens, handled above); see
+        // `LRPrefix`/`left_right_group` for the phrasing decision based on
+        // the opening delimiter and whatever preceded it.
         if let NodeOrToken::Node(node) = &elements[i] {
             if node.kind() == ItemLR {
-                let (word, inner) = left_right_group(node)?;
-                if *has_content {
-                    if let Some(word) = word {
-                        push_word(out, word);
+                let (prefix, inner) = left_right_group(node)?;
+                match prefix {
+                    LRPrefix::None => {}
+                    LRPrefix::IfPreceded(word) => {
+                        if *has_content {
+                            push_word(out, word);
+                        }
                     }
+                    LRPrefix::Always(word) => push_word(out, word),
                 }
                 let mut inner_has_content = false;
                 speak_sequence(&inner, out, &mut inner_has_content)?;
@@ -232,12 +236,26 @@ fn render_element_alone(element: &Element) -> Result<String> {
     Ok(out)
 }
 
-/// Splits an `ItemLR` node (`\left DELIM ... \right DELIM`) into the word
-/// to speak for its opening delimiter (`None` for `\left\{`/`\left.`/etc.
-/// — brace and "invisible" delimiters are plain grouping, no "of"/"at
-/// index" trigger word, same as a bare `{...}` group) and its middle
-/// content, as an element list ready for `speak_sequence`.
-fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Element>)> {
+/// The word (if any) an `ItemLR`'s opening delimiter contributes, and
+/// whether it's conditioned on something already having been spoken.
+enum LRPrefix {
+    /// Brace/"invisible" delimiters — plain grouping, same as a bare
+    /// `{...}` group.
+    None,
+    /// Function-application delimiters (`(`/`[`): the word only applies
+    /// when something was just spoken immediately before, e.g. `x(t)` ->
+    /// "x of t" but a leading `(a+b)` is silent grouping.
+    IfPreceded(&'static str),
+    /// A named operation whose delimiters always speak the same prefix
+    /// regardless of what precedes them, e.g. `|x|` -> "the absolute
+    /// value of x" whether or not `x` follows other content.
+    Always(&'static str),
+}
+
+/// Splits an `ItemLR` node (`\left DELIM ... \right DELIM`) into its
+/// `LRPrefix` and middle content, as an element list ready for
+/// `speak_sequence`.
+fn left_right_group(node: &SyntaxNode) -> Result<(LRPrefix, Vec<Element>)> {
     let children: Vec<Element> = node.children_with_tokens().collect();
     let clause_positions: Vec<usize> =
         children.iter().enumerate().filter(|(_, e)| matches!(e, NodeOrToken::Node(n) if n.kind() == ClauseLR)).map(|(i, _)| i).collect();
@@ -246,17 +264,21 @@ fn left_right_group(node: &SyntaxNode) -> Result<(Option<&'static str>, Vec<Elem
     };
 
     let NodeOrToken::Node(open_clause) = &children[*open_pos] else { unreachable!() };
-    let word = open_clause
+    let prefix = open_clause
         .children_with_tokens()
         .filter_map(|e| e.into_token())
         .find_map(|t| match t.kind() {
-            TokenLParen => Some("of"),
-            TokenLBracket => Some("at index"),
+            TokenLParen => Some(LRPrefix::IfPreceded("of")),
+            TokenLBracket => Some(LRPrefix::IfPreceded("at index")),
+            // `|`/`\vert` has no dedicated token kind in mitex_parser — it
+            // comes through as a plain `TokenWord` with text `"|"`.
+            TokenWord if t.text() == "|" => Some(LRPrefix::Always("the absolute value of")),
             _ => None,
-        });
+        })
+        .unwrap_or(LRPrefix::None);
 
     let inner = children[open_pos + 1..*close_pos].to_vec();
-    Ok((word, inner))
+    Ok((prefix, inner))
 }
 
 /// `-`/`+`/`=`/`<`/`>` glued directly into a word (no surrounding spaces)
@@ -1432,6 +1454,19 @@ mod tests {
     #[test]
     fn slash_division_repeated_operand_speaks_anaphorically() {
         assert_eq!(speak("2^{n-1} / 2^{n-1}").unwrap(), "2 to the n minus 1 over itself");
+    }
+
+    #[test]
+    fn absolute_value_bars() {
+        assert_eq!(speak(r"\left|x\right|").unwrap(), "the absolute value of x");
+    }
+
+    #[test]
+    fn absolute_value_bars_of_function_call() {
+        assert_eq!(
+            speak(r"\left|v\left(-2^{n-1}\right)\right|").unwrap(),
+            "the absolute value of v of negative 2 to the n minus 1"
+        );
     }
 
     #[test]
