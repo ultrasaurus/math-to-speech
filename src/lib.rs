@@ -784,9 +784,23 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
     match name {
         "frac" => {
             let [num, den] = require_args(&args, "frac")?;
-            speak_children(num, out)?;
+            let mut num_phrase = String::new();
+            speak_children(num, &mut num_phrase)?;
+            push_word(out, &num_phrase);
             push_word(out, "over");
-            speak_children(den, out)?;
+
+            // A denominator that would speak identically to the numerator
+            // (e.g. `\frac{2^{n-1}}{2^{n-1}}`) is said anaphorically instead
+            // of repeated verbatim — repeated identical phrases are both a
+            // known TTS/forced-alignment artifact source and slower for a
+            // listener to parse than "over itself".
+            let mut den_phrase = String::new();
+            speak_children(den, &mut den_phrase)?;
+            if den_phrase == num_phrase {
+                push_word(out, "itself");
+            } else {
+                push_word(out, &den_phrase);
+            }
             Ok(())
         }
         "sqrt" => {
@@ -1134,6 +1148,14 @@ mod tests {
     #[test]
     fn fraction() {
         assert_eq!(speak(r"\frac{\pi}{2}").unwrap(), "pi over 2");
+    }
+
+    #[test]
+    fn fraction_repeated_denominator_speaks_anaphorically() {
+        assert_eq!(
+            speak(r"\frac{2^{n-1}}{2^{n-1}}").unwrap(),
+            "2 to the n minus 1 over itself"
+        );
     }
 
     #[test]
