@@ -183,6 +183,28 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             }
         }
 
+        // A trailing `+` right before a row break (`... + \\`, continuing
+        // a sum onto the next row) grammatically belongs to the *next*
+        // row's clause, not the one ending — "phi sub 1; plus, A sub 2..."
+        // reads correctly, "phi sub 1 plus; A sub 2..." doesn't (the
+        // semicolon lands mid-clause, right after the connective word that
+        // should introduce what follows it). So the row-break semicolon
+        // is emitted *before* this trailing `+`, and the `+` itself is
+        // followed by a comma rather than running straight into the next
+        // row's content.
+        if is_lone_plus(&elements[i]) {
+            if let Some(nl_idx) = next_nontrivial_index(elements, i) {
+                if matches!(&elements[nl_idx], NodeOrToken::Token(t) if t.kind() == ItemNewLine) {
+                    out.push(';');
+                    push_word(out, "plus");
+                    out.push(',');
+                    *has_content = true;
+                    i = nl_idx + 1;
+                    continue;
+                }
+            }
+        }
+
         // Bare `a / b` division where `a` and `b` are the single elements
         // immediately either side of the slash (mirrors the `\frac{a}{b}`
         // "itself" collapse — see there for rationale). Deliberately
@@ -211,13 +233,22 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         // `\cdot` between two "atomic" factors (a number, a plain or
         // subscripted variable, `\pi`, a named function) is silent, the
         // same way a person reads `A_1 \cdot \cos(2\pi \cdot f_1 \cdot t)`
-        // aloud as "A one cosine of two pi f one t" rather than spelling
+        // aloud as "A one, cosine of two pi, f one, t" rather than spelling
         // out every implicit multiplication as "times". `\times` is left
         // alone — unlike `\cdot`, it's normally chosen specifically to
         // call out multiplication rather than glue adjacent factors, e.g.
         // `3 \times 4`. Only suppressed when *both* sides are atomic, so
         // e.g. `(a+b) \cdot (c+d)` or `\sqrt{2} \cdot 3` keep "times" —
         // dropping it there would be genuinely ambiguous.
+        //
+        // A comma takes "times"'s place rather than nothing at all — with
+        // no separator, adjacent atomic factors run together into a single
+        // unclear blob ("2 pi f sub 1 t"); the comma preserves a clear
+        // prosodic break between factors without spelling out "times"
+        // every time. Glued directly onto the prior word (no leading
+        // space) the same way every other comma in this file is, so
+        // `push_word`'s own space-before-next-word logic supplies the gap
+        // before the next factor.
         if let NodeOrToken::Node(node) = &elements[i] {
             if node.kind() == ItemCmd && cmd_name(node).as_deref() == Some("cdot") {
                 if let (Some(prev_idx), Some(next_idx)) =
@@ -226,6 +257,7 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                     if is_atomic_multiplicand(&elements[prev_idx], Side::Prev)
                         && is_atomic_multiplicand(&elements[next_idx], Side::Next)
                     {
+                        out.push(',');
                         i += 1;
                         continue;
                     }
@@ -268,6 +300,24 @@ fn next_nontrivial_index(elements: &[Element], i: usize) -> Option<usize> {
 
 fn is_trivial(element: &Element) -> bool {
     matches!(element, NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
+}
+
+/// True for an element that's nothing but a standalone `+` — either a
+/// bare `TokenWord` (`"+"` on its own) or an `ItemText` wrapper around
+/// exactly one such token (mitex wraps a run like `b \;+` so that the `+`
+/// ends up as the sole non-trivial token in an `ItemText` node, not a bare
+/// sibling). Used to spot a sum continuing across a row break (see the
+/// row-break handling above).
+fn is_lone_plus(element: &Element) -> bool {
+    let is_plus_token = |t: &mitex_parser::syntax::SyntaxToken| t.kind() == TokenWord && t.text() == "+";
+    match element {
+        NodeOrToken::Token(t) => is_plus_token(t),
+        NodeOrToken::Node(n) if n.kind() == ItemText => {
+            let toks: Vec<_> = n.children_with_tokens().filter_map(|e| e.into_token()).filter(|t| !is_trivial(&NodeOrToken::Token(t.clone()))).collect();
+            matches!(toks.as_slice(), [only] if is_plus_token(only))
+        }
+        _ => false,
+    }
 }
 
 /// True when the rendered phrase of a preceding element *ends with* a
@@ -551,7 +601,10 @@ fn speak_element(element: &Element, out: &mut String, has_content: bool) -> Resu
             // pause rather than spoken words.
             TokenAmpersand => Ok(()),
             ItemNewLine => {
-                out.push(',');
+                // A semicolon, not a comma — see `speak_env`'s doc comment
+                // for why each row gets a stronger break than a comma
+                // pause.
+                out.push(';');
                 Ok(())
             }
             TokenLBrace | TokenRBrace => Ok(()),
@@ -581,8 +634,16 @@ fn speak_node(node: &SyntaxNode, out: &mut String, has_content: bool) -> Result<
 /// for `align*`/`split` it just marks where the `=` lines up, and for
 /// `cases` the condition after it is already written out in prose by the
 /// author (`\text{if } n = 0`), so there's nothing to inject — silent in
-/// both. `\\` (row break, `ItemNewLine`) becomes a comma pause between
-/// rows.
+/// both. `\\` (row break, `ItemNewLine`) becomes a semicolon rather than a
+/// comma — a multi-row sum otherwise reads as a single very long sentence
+/// with nothing stronger than comma pauses between rows, which real-world
+/// documents have shown produces its own TTS artifacts (observed: the
+/// last row getting spoken twice) independent of anything about the math
+/// content itself. A semicolon rather than a period deliberately: this
+/// crate has no notion of sentence boundaries or capitalization, so it
+/// can't correctly start a new sentence after a row break (the next row
+/// may not begin with something that should be capitalized) — a
+/// semicolon gives a stronger break than a comma without implying one.
 ///
 /// A true grid environment (`matrix`/`pmatrix`/`bmatrix`/`vmatrix`/
 /// `Vmatrix`/`smallmatrix`/`array`) is deliberately *not* in that
@@ -1573,8 +1634,8 @@ mod tests {
     fn periodicity_equation_speaks_plus() {
         assert_eq!(
             speak(r"x(t) = x(t + t_0) = x(t + 2\cdot t_0) = x(t + 3\cdot t_0) = \dots").unwrap(),
-            "x of t equals x of t plus t sub 0 equals x of t plus 2 t sub 0 \
-             equals x of t plus 3 t sub 0 equals dot dot dot"
+            "x of t equals x of t plus t sub 0 equals x of t plus 2, t sub 0 \
+             equals x of t plus 3, t sub 0 equals dot dot dot"
         );
     }
 
@@ -1609,12 +1670,12 @@ mod tests {
 
     #[test]
     fn cdot_between_atomic_factors_is_silent() {
-        assert_eq!(speak(r"2 \cdot \pi \cdot f_1 \cdot t").unwrap(), "2 pi f sub 1 t");
+        assert_eq!(speak(r"2 \cdot \pi \cdot f_1 \cdot t").unwrap(), "2, pi, f sub 1, t");
     }
 
     #[test]
     fn cdot_before_named_function_is_silent() {
-        assert_eq!(speak(r"A_1 \cdot \cos(x)").unwrap(), "A sub 1 cosine of x");
+        assert_eq!(speak(r"A_1 \cdot \cos(x)").unwrap(), "A sub 1, cosine of x");
     }
 
     #[test]
@@ -1622,7 +1683,7 @@ mod tests {
         // `t + \phi_1` parses as one `ItemText` node (`t`, `+`, `\phi_1`),
         // not separate siblings — only `t`, the token actually touching
         // `\cdot`, should matter for the silence decision.
-        assert_eq!(speak(r"f_1 \cdot t + \phi_1").unwrap(), "f sub 1 t plus phi sub 1");
+        assert_eq!(speak(r"f_1 \cdot t + \phi_1").unwrap(), "f sub 1, t plus phi sub 1");
     }
 
     #[test]
@@ -1765,23 +1826,38 @@ mod tests {
     }
 
     #[test]
+    fn align_environment_row_break_is_a_semicolon() {
+        assert_eq!(speak(r"\begin{align*} a &= 1\\ b &= 2\\ c &= 3 \end{align*}").unwrap(), "a equals 1; b equals 2; c equals 3");
+    }
+
+    #[test]
+    fn trailing_plus_before_row_break_moves_after_the_semicolon() {
+        // The `+` continuing a sum onto the next row belongs to that next
+        // row's clause, not the one ending — "a; plus, b" reads correctly,
+        // "a plus; b" doesn't (the connective word stays glued to the
+        // wrong side of the pause).
+        assert_eq!(speak(r"\begin{align*} a \;+\\ &b \end{align*}").unwrap(), "a; plus, b");
+    }
+
+    #[test]
     fn split_environment() {
-        assert_eq!(speak(r"\begin{split} x &= 1\\ &= 2 \end{split}").unwrap(), "x equals 1, equals 2");
+        assert_eq!(speak(r"\begin{split} x &= 1\\ &= 2 \end{split}").unwrap(), "x equals 1; equals 2");
     }
 
     #[test]
     fn align_environment() {
-        assert_eq!(speak(r"\begin{align*} a &= 1\\ b &= 2 \end{align*}").unwrap(), "a equals 1, b equals 2");
+        assert_eq!(speak(r"\begin{align*} a &= 1\\ b &= 2 \end{align*}").unwrap(), "a equals 1; b equals 2");
     }
 
     #[test]
     fn cases_environment() {
         // The author already writes "if"/"otherwise" as prose (`\text{if
         // }`), so the environment itself contributes only the row-break
-        // pause between the two cases — no connective word is injected.
+        // semicolon between the two cases — no connective word is
+        // injected.
         assert_eq!(
             speak(r"\begin{cases} 1 & \text{if } n = 0\\ 0 & \text{otherwise}. \end{cases}").unwrap(),
-            "1 if n equals 0, 0 otherwise ."
+            "1 if n equals 0; 0 otherwise ."
         );
     }
 
@@ -1795,9 +1871,9 @@ mod tests {
                 r"\begin{align*} x(t) =& A_1 \cdot \cos(2\pi \cdot f_1 \cdot t + \phi_1) \;+\\ &A_2\cdot \cos(2\pi \cdot f_2\cdot t + \phi_2) \;+\\ &A_3\cdot \cos(2\pi \cdot f_3\cdot t + \phi_3) + \cdots \end{align*}"
             )
             .unwrap(),
-            "x of t equals A sub 1 cosine of 2 pi f sub 1 t plus phi sub 1 plus, \
-             A sub 2 cosine of 2 pi f sub 2 t plus phi sub 2 plus, \
-             A sub 3 cosine of 2 pi f sub 3 t plus phi sub 3 plus dot dot dot"
+            "x of t equals A sub 1, cosine of 2 pi, f sub 1, t plus phi sub 1; \
+             plus, A sub 2, cosine of 2 pi, f sub 2, t plus phi sub 2; \
+             plus, A sub 3, cosine of 2 pi, f sub 3, t plus phi sub 3 plus dot dot dot"
         );
     }
 
