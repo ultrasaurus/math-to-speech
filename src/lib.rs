@@ -22,6 +22,25 @@ pub fn speak(tex: &str) -> Result<String> {
     Ok(collapse_whitespace(&out))
 }
 
+/// Delimiter pairs `strip_math_delimiters` recognizes, checked in order
+/// (longest/most-specific first, so `$$` isn't mistaken for a `$` pair).
+const MATH_DELIMITERS: &[(&str, &str)] =
+    &[("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$")];
+
+/// If `tex` is wrapped in one recognized pair of math delimiters (`$...$`,
+/// `$$...$$`, `\(...\)`, `\[...\]`), strip it and return the inner source
+/// along with the delimiter pair that was found. Otherwise returns `tex`
+/// unchanged with `None`.
+pub fn strip_math_delimiters(tex: &str) -> (&str, Option<(&'static str, &'static str)>) {
+    let trimmed = tex.trim();
+    for &(open, close) in MATH_DELIMITERS {
+        if let Some(inner) = trimmed.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+            return (inner.trim(), Some((open, close)));
+        }
+    }
+    (tex, None)
+}
+
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1611,7 +1630,7 @@ fn symbol_word(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::speak;
+    use super::{speak, strip_math_delimiters};
 
     #[test]
     fn fraction() {
@@ -2211,5 +2230,44 @@ mod tests {
     #[test]
     fn braces_dont_trigger_of_on_the_paren_they_precede() {
         assert_eq!(speak(r"\frac{1}{(x-2)}").unwrap(), "1 over x minus 2");
+    }
+
+    #[test]
+    fn strip_math_delimiters_leaves_bare_tex_unchanged() {
+        assert_eq!(strip_math_delimiters(r"x^2"), ("x^2", None));
+    }
+
+    #[test]
+    fn strip_math_delimiters_strips_display_brackets() {
+        assert_eq!(
+            strip_math_delimiters(r"\[x^2\]"),
+            ("x^2", Some(("\\[", "\\]")))
+        );
+    }
+
+    #[test]
+    fn strip_math_delimiters_strips_inline_parens() {
+        assert_eq!(
+            strip_math_delimiters(r"\(x^2\)"),
+            ("x^2", Some(("\\(", "\\)")))
+        );
+    }
+
+    #[test]
+    fn strip_math_delimiters_strips_double_dollar_before_single() {
+        assert_eq!(
+            strip_math_delimiters(r"$$x^2$$"),
+            ("x^2", Some(("$$", "$$")))
+        );
+    }
+
+    #[test]
+    fn strip_math_delimiters_strips_single_dollar() {
+        assert_eq!(strip_math_delimiters(r"$x^2$"), ("x^2", Some(("$", "$"))));
+    }
+
+    #[test]
+    fn strip_math_delimiters_leaves_mismatched_pair_unchanged() {
+        assert_eq!(strip_math_delimiters(r"\[x^2)"), (r"\[x^2)", None));
     }
 }

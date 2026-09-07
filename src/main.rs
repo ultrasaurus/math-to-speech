@@ -9,7 +9,12 @@ fn main() -> ExitCode {
         }
     };
 
-    match math_to_speech::speak(&tex) {
+    let (tex, stripped) = math_to_speech::strip_math_delimiters(&tex);
+    if let Some((open, close)) = stripped {
+        eprintln!("stripped outer delimiter '{open}...{close}'");
+    }
+
+    match math_to_speech::speak(tex) {
         Ok(phrase) => {
             println!("{phrase}");
             ExitCode::SUCCESS
