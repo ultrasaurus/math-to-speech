@@ -208,6 +208,31 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             }
         }
 
+        // `\cdot` between two "atomic" factors (a number, a plain or
+        // subscripted variable, `\pi`, a named function) is silent, the
+        // same way a person reads `A_1 \cdot \cos(2\pi \cdot f_1 \cdot t)`
+        // aloud as "A one cosine of two pi f one t" rather than spelling
+        // out every implicit multiplication as "times". `\times` is left
+        // alone — unlike `\cdot`, it's normally chosen specifically to
+        // call out multiplication rather than glue adjacent factors, e.g.
+        // `3 \times 4`. Only suppressed when *both* sides are atomic, so
+        // e.g. `(a+b) \cdot (c+d)` or `\sqrt{2} \cdot 3` keep "times" —
+        // dropping it there would be genuinely ambiguous.
+        if let NodeOrToken::Node(node) = &elements[i] {
+            if node.kind() == ItemCmd && cmd_name(node).as_deref() == Some("cdot") {
+                if let (Some(prev_idx), Some(next_idx)) =
+                    (prev_nontrivial_index(elements, i), next_nontrivial_index(elements, i))
+                {
+                    if is_atomic_multiplicand(&elements[prev_idx], Side::Prev)
+                        && is_atomic_multiplicand(&elements[next_idx], Side::Next)
+                    {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         speak_element(&elements[i], out, *has_content)?;
         // Tokens that `speak_element` speaks as nothing (see its match arms
         // below) must not count as "just spoke something" either, or the
@@ -286,6 +311,70 @@ fn is_connective_word(phrase: &str) -> bool {
         "if and only if",
     ];
     CONNECTIVES.iter().any(|c| phrase == *c || phrase.ends_with(&format!(" {c}")))
+}
+
+/// An `ItemCmd` node's command name, without the leading `\` — `None` if
+/// the node has no `ClauseCommandName` child (shouldn't happen for a
+/// well-formed command, but this is also used speculatively on arbitrary
+/// elements).
+fn cmd_name(node: &SyntaxNode) -> Option<String> {
+    node.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == ClauseCommandName)
+        .map(|t| t.text().trim_start_matches('\\').to_string())
+}
+
+/// Which side of a `\cdot` an element is on — determines which end of a
+/// multi-token `ItemText` run (see below) actually borders the `\cdot`.
+#[derive(Clone, Copy)]
+enum Side {
+    Prev,
+    Next,
+}
+
+/// True for an element that reads as one self-contained lexical item —
+/// a number/variable token, a subscripted/superscripted variable whose
+/// base is itself atomic, or a bare symbol/named-function command — as
+/// opposed to a compound expression (a parenthesized group, a sum of
+/// terms, `\frac`/`\sqrt`/`\sum`-style commands that already speak as
+/// their own multi-word phrase). Used to decide whether a `\cdot` between
+/// two factors can be silent (see the `ItemCmd` "cdot" handling above)
+/// without creating ambiguity.
+///
+/// `side` matters for an `ItemText` run: mitex groups something like
+/// `t + \phi_1` into one `ItemText` node (`t`, `+`, ...) rather than
+/// separate siblings, so only the token actually touching the `\cdot`
+/// (the last one for a `Prev` element, the first for a `Next` element)
+/// is relevant — the rest of the run belongs to a different operator
+/// entirely and says nothing about whether *this* multiplication is
+/// ambiguous.
+fn is_atomic_multiplicand(element: &Element, side: Side) -> bool {
+    match element {
+        NodeOrToken::Token(t) => t.kind() == TokenWord,
+        NodeOrToken::Node(n) if n.kind() == ItemAttachComponent => {
+            let Ok(attach) = parse_attach(n) else { return false };
+            let base = flat_base_elements(&attach.base);
+            matches!(base.as_slice(), [only] if is_atomic_multiplicand(only, side))
+        }
+        NodeOrToken::Node(n) if n.kind() == ItemCmd => {
+            const PHRASE_COMMANDS: &[&str] =
+                &["frac", "sqrt", "sum", "prod", "int", "lim", "min", "max", "det", "gcd", "lfloor", "rfloor"];
+            cmd_name(n).is_some_and(|name| symbol_word(&name).is_some() && !PHRASE_COMMANDS.contains(&name.as_str()))
+        }
+        NodeOrToken::Node(n) if n.kind() == ItemText => {
+            let toks: Vec<_> = n
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| !matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
+                .collect();
+            let boundary = match side {
+                Side::Prev => toks.last(),
+                Side::Next => toks.first(),
+            };
+            boundary.is_some_and(|t| t.kind() == TokenWord)
+        }
+        _ => false,
+    }
 }
 
 /// Renders a single element in a fresh "nothing spoken yet" context,
@@ -1484,8 +1573,8 @@ mod tests {
     fn periodicity_equation_speaks_plus() {
         assert_eq!(
             speak(r"x(t) = x(t + t_0) = x(t + 2\cdot t_0) = x(t + 3\cdot t_0) = \dots").unwrap(),
-            "x of t equals x of t plus t sub 0 equals x of t plus 2 times t sub 0 \
-             equals x of t plus 3 times t sub 0 equals dot dot dot"
+            "x of t equals x of t plus t sub 0 equals x of t plus 2 t sub 0 \
+             equals x of t plus 3 t sub 0 equals dot dot dot"
         );
     }
 
@@ -1516,6 +1605,39 @@ mod tests {
     #[test]
     fn slash_division_repeated_operand_speaks_anaphorically() {
         assert_eq!(speak("2^{n-1} / 2^{n-1}").unwrap(), "2 to the n minus 1 over itself");
+    }
+
+    #[test]
+    fn cdot_between_atomic_factors_is_silent() {
+        assert_eq!(speak(r"2 \cdot \pi \cdot f_1 \cdot t").unwrap(), "2 pi f sub 1 t");
+    }
+
+    #[test]
+    fn cdot_before_named_function_is_silent() {
+        assert_eq!(speak(r"A_1 \cdot \cos(x)").unwrap(), "A sub 1 cosine of x");
+    }
+
+    #[test]
+    fn cdot_boundary_word_in_larger_text_run_is_still_detected() {
+        // `t + \phi_1` parses as one `ItemText` node (`t`, `+`, `\phi_1`),
+        // not separate siblings — only `t`, the token actually touching
+        // `\cdot`, should matter for the silence decision.
+        assert_eq!(speak(r"f_1 \cdot t + \phi_1").unwrap(), "f sub 1 t plus phi sub 1");
+    }
+
+    #[test]
+    fn cdot_between_compound_expressions_keeps_times() {
+        assert_eq!(speak(r"(a+b) \cdot (c+d)").unwrap(), "a plus b times c plus d");
+    }
+
+    #[test]
+    fn cdot_next_to_phrase_command_keeps_times() {
+        assert_eq!(speak(r"\sqrt{2} \cdot 3").unwrap(), "the square root of 2 times 3");
+    }
+
+    #[test]
+    fn times_command_always_spoken() {
+        assert_eq!(speak(r"3 \times 4").unwrap(), "3 times 4");
     }
 
     #[test]
@@ -1673,9 +1795,9 @@ mod tests {
                 r"\begin{align*} x(t) =& A_1 \cdot \cos(2\pi \cdot f_1 \cdot t + \phi_1) \;+\\ &A_2\cdot \cos(2\pi \cdot f_2\cdot t + \phi_2) \;+\\ &A_3\cdot \cos(2\pi \cdot f_3\cdot t + \phi_3) + \cdots \end{align*}"
             )
             .unwrap(),
-            "x of t equals A sub 1 times cosine of 2 pi times f sub 1 times t plus phi sub 1 plus, \
-             A sub 2 times cosine of 2 pi times f sub 2 times t plus phi sub 2 plus, \
-             A sub 3 times cosine of 2 pi times f sub 3 times t plus phi sub 3 plus dot dot dot"
+            "x of t equals A sub 1 cosine of 2 pi f sub 1 t plus phi sub 1 plus, \
+             A sub 2 cosine of 2 pi f sub 2 t plus phi sub 2 plus, \
+             A sub 3 cosine of 2 pi f sub 3 t plus phi sub 3 plus dot dot dot"
         );
     }
 
