@@ -226,6 +226,17 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                         i = next_idx + 1;
                         continue;
                     }
+                    // A small named fraction (`3 / 2` -> "three halves") —
+                    // see `named_fraction_word`'s doc comment. `prev_phrase`
+                    // is already sitting in `out` from the previous loop
+                    // iteration, so only the denominator's word is pushed
+                    // here, in place of "over" + the denominator itself.
+                    if let Some(word) = named_fraction_word(&prev_phrase, &next_phrase) {
+                        push_word(out, word);
+                        *has_content = true;
+                        i = next_idx + 1;
+                        continue;
+                    }
                 }
             }
         }
@@ -435,6 +446,99 @@ fn render_element_alone(element: &Element) -> Result<String> {
     let mut out = String::new();
     speak_element(element, &mut out, false)?;
     Ok(out)
+}
+
+/// `phrase` as a `u32` if it's nothing but bare ASCII digits — `None` for
+/// anything else (a variable, a negative/glued-operator word, an
+/// expression). Used to recognize a fraction's numerator/denominator as a
+/// literal integer rather than an arbitrary sub-expression.
+fn bare_integer(phrase: &str) -> Option<u32> {
+    (!phrase.is_empty() && phrase.chars().all(|c| c.is_ascii_digit())).then(|| phrase.parse().ok()).flatten()
+}
+
+/// The named word for a fraction's denominator `n` — "half"/"halves"
+/// through "sixteenth"/"sixteenths" (`singular` for a numerator of 1,
+/// plural otherwise) — `None` past sixteenths, where there's no common
+/// named word and a plain "over" reading is clearer anyway.
+fn fraction_denominator_word(n: u32, singular: bool) -> Option<&'static str> {
+    Some(match (n, singular) {
+        (2, true) => "half",
+        (2, false) => "halves",
+        (3, true) => "third",
+        (3, false) => "thirds",
+        (4, true) => "fourth",
+        (4, false) => "fourths",
+        (5, true) => "fifth",
+        (5, false) => "fifths",
+        (6, true) => "sixth",
+        (6, false) => "sixths",
+        (7, true) => "seventh",
+        (7, false) => "sevenths",
+        (8, true) => "eighth",
+        (8, false) => "eighths",
+        (9, true) => "ninth",
+        (9, false) => "ninths",
+        (10, true) => "tenth",
+        (10, false) => "tenths",
+        (11, true) => "eleventh",
+        (11, false) => "elevenths",
+        (12, true) => "twelfth",
+        (12, false) => "twelfths",
+        (13, true) => "thirteenth",
+        (13, false) => "thirteenths",
+        (14, true) => "fourteenth",
+        (14, false) => "fourteenths",
+        (15, true) => "fifteenth",
+        (15, false) => "fifteenths",
+        (16, true) => "sixteenth",
+        (16, false) => "sixteenths",
+        _ => return None,
+    })
+}
+
+/// The named-fraction word for `numerator/denominator` (`"1"`/`"2"` ->
+/// `Some("half")`), when both sides are bare integer literals and the
+/// denominator has a common name (halves through sixteenths) — mirrors
+/// the equivalent rule in `odoru`'s text normalizer for plain `N/M` text
+/// (see its `dev/normalize.md`, Pass 4b), which can't reach a
+/// LaTeX-derived fraction itself: by the time this crate's phrase reaches
+/// that normalizer, the `/` is already gone, replaced by the word "over".
+/// `None` for a variable numerator/denominator (`n/f_s`), an expression
+/// (`n-1`), or a denominator past sixteenths, where the caller should
+/// keep the plain "N over M" reading instead.
+///
+/// The numerator is deliberately left as a bare digit for the caller to
+/// push as-is (`"1 half"`, not `"one half"`) — this crate never spells
+/// digits into words anywhere else either (e.g. `\frac{\pi}{2}` -> "pi
+/// over 2", not "two"); that's the caller's normalizer's job, and it will
+/// spell a bare leftover numerator the same way it spells any other bare
+/// number in the sentence.
+fn named_fraction_word(numerator: &str, denominator: &str) -> Option<&'static str> {
+    bare_integer(numerator)?;
+    let denominator = bare_integer(denominator)?;
+    fraction_denominator_word(denominator, numerator == "1")
+}
+
+/// Speaks a fraction given its already-rendered numerator/denominator
+/// phrases — shared by `\frac{a}{b}` and the bare `a / b` division path.
+/// Picks, in order: "itself" when the two sides render identically (a
+/// denominator that would otherwise repeat the numerator verbatim, e.g.
+/// `\frac{2^{n-1}}{2^{n-1}}` — repeated identical phrases are both a known
+/// TTS/forced-alignment artifact source and slower for a listener to
+/// parse than "over itself"), a named fraction word when both sides are
+/// small bare integers (see `named_fraction_word`), or a plain "N over M"
+/// otherwise.
+fn speak_fraction(num_phrase: &str, den_phrase: &str, out: &mut String) {
+    push_word(out, num_phrase);
+    if den_phrase == num_phrase {
+        push_word(out, "over");
+        push_word(out, "itself");
+    } else if let Some(word) = named_fraction_word(num_phrase, den_phrase) {
+        push_word(out, word);
+    } else {
+        push_word(out, "over");
+        push_word(out, den_phrase);
+    }
 }
 
 /// The word (if any) an `ItemLR`'s opening delimiter contributes, and
@@ -1072,21 +1176,9 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             let [num, den] = require_args(&args, "frac")?;
             let mut num_phrase = String::new();
             speak_children(num, &mut num_phrase)?;
-            push_word(out, &num_phrase);
-            push_word(out, "over");
-
-            // A denominator that would speak identically to the numerator
-            // (e.g. `\frac{2^{n-1}}{2^{n-1}}`) is said anaphorically instead
-            // of repeated verbatim — repeated identical phrases are both a
-            // known TTS/forced-alignment artifact source and slower for a
-            // listener to parse than "over itself".
             let mut den_phrase = String::new();
             speak_children(den, &mut den_phrase)?;
-            if den_phrase == num_phrase {
-                push_word(out, "itself");
-            } else {
-                push_word(out, &den_phrase);
-            }
+            speak_fraction(&num_phrase, &den_phrase, out);
             Ok(())
         }
         "sqrt" => {
@@ -1445,6 +1537,29 @@ mod tests {
     }
 
     #[test]
+    fn frac_small_named_fractions() {
+        assert_eq!(speak(r"\frac{1}{2}").unwrap(), "1 half");
+        assert_eq!(speak(r"\frac{3}{2}").unwrap(), "3 halves");
+        assert_eq!(speak(r"\frac{2}{3}").unwrap(), "2 thirds");
+        assert_eq!(speak(r"\frac{1}{16}").unwrap(), "1 sixteenth");
+        assert_eq!(speak(r"\frac{5}{37}").unwrap(), "5 over 37");
+    }
+
+    #[test]
+    fn frac_named_fraction_requires_bare_integers() {
+        // A variable or expression on either side keeps the plain "over"
+        // reading — only a literal integer numerator/denominator qualify.
+        assert_eq!(speak(r"\frac{n}{2}").unwrap(), "n over 2");
+        assert_eq!(speak(r"\frac{1}{f_s}").unwrap(), "1 over f sub s");
+    }
+
+    #[test]
+    fn slash_division_small_named_fraction() {
+        assert_eq!(speak("1 / 2").unwrap(), "1 half");
+        assert_eq!(speak("2 / 3").unwrap(), "2 thirds");
+    }
+
+    #[test]
     fn squared() {
         assert_eq!(speak("x^2").unwrap(), "x squared");
     }
@@ -1618,7 +1733,7 @@ mod tests {
         assert_eq!(speak(r"x(-1)").unwrap(), "x of negative 1");
         assert_eq!(speak(r"x[-1]").unwrap(), "x at index negative 1");
         assert_eq!(speak(r"\sqrt{-1}").unwrap(), "the square root of negative 1");
-        assert_eq!(speak(r"\frac{1}{2} - p_1").unwrap(), "1 over 2 minus p sub 1");
+        assert_eq!(speak(r"\frac{1}{2} - p_1").unwrap(), "1 half minus p sub 1");
         assert_eq!(speak(r"e^{-1}").unwrap(), "e to the negative 1");
     }
 
