@@ -938,6 +938,16 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
         }
         _ => {
             if let Some(word) = symbol_word(name) {
+                // A list separator comma glued directly before the dots
+                // family (`1, 0, \dots` -> "1, 0, dot dot dot") leaves a
+                // pause immediately followed by three repeats of the same
+                // word — a shape TTS backends have been observed to garble.
+                // Drop the trailing comma here rather than at the generic
+                // `TokenComma` site, so an ordinary `1, 2, \pi` keeps its
+                // comma.
+                if matches!(name, "dots" | "ldots" | "cdots" | "vdots" | "ddots") && out.ends_with(',') {
+                    out.pop();
+                }
                 push_word(out, word);
                 Ok(())
             } else {
@@ -1244,7 +1254,7 @@ mod tests {
         assert_eq!(speak("-1").unwrap(), "negative 1");
         assert_eq!(speak("N-1").unwrap(), "N minus 1");
         assert_eq!(speak("5-3").unwrap(), "5 minus 3");
-        assert_eq!(speak(r"0, 1, 2, \dots, N-1").unwrap(), "0, 1, 2, dot dot dot, N minus 1");
+        assert_eq!(speak(r"0, 1, 2, \dots, N-1").unwrap(), "0, 1, 2 dot dot dot, N minus 1");
     }
 
     #[test]
@@ -1490,8 +1500,19 @@ mod tests {
 
     #[test]
     fn ellipsis_commands() {
-        assert_eq!(speak(r"0, 1, 2, \dots").unwrap(), "0, 1, 2, dot dot dot");
+        assert_eq!(speak(r"0, 1, 2, \dots").unwrap(), "0, 1, 2 dot dot dot");
         assert_eq!(speak(r"\cdots").unwrap(), "dot dot dot");
+    }
+
+    // The reported case: a comma directly before the dots family leaves a
+    // pause immediately followed by three repeats of the same word, which
+    // TTS backends have been observed to garble.
+    #[test]
+    fn ellipsis_drops_preceding_comma() {
+        assert_eq!(
+            speak(r"x[n] = 1, 0, -1, 0, 1, 0, -1, 0, \dots").unwrap(),
+            "x at index n equals 1, 0, negative 1, 0, 1, 0, negative 1, 0 dot dot dot"
+        );
     }
 
     // Unbraced `n^th` is standard LaTeX for `n^t` followed by a plain
