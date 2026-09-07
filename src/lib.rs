@@ -793,6 +793,19 @@ struct Attach {
 fn speak_attach(node: &SyntaxNode, out: &mut String, has_content: bool) -> Result<()> {
     let attach = parse_attach(node)?;
 
+    // `\sum_{i=1}^{n}`, `\prod`/`\int`/`\lim` with sub/sup bounds — these
+    // need their own phrasing entirely (see `speak_bound_operator`), not
+    // the generic base-then-scripts path below: their base word already
+    // has "of" baked in (`symbol_word("sum")` -> "the sum of"), so
+    // blindly appending the generic "to the n"/"sub i equals 1" after it
+    // produced "the sum of to the n sub i equals 1" instead of "the sum
+    // from i equals 1 to n of".
+    if let Some(name) = base_command_name(&attach.base) {
+        if speak_bound_operator(&name, &attach, out)? {
+            return Ok(());
+        }
+    }
+
     // mitex glues a mid-sequence `-` onto the *next* operand's leading
     // token when that operand becomes an attach's base — `p_1-p_2` parses
     // `-p` as one word, the base of the second `_2` attach (and `p_1 -
@@ -890,11 +903,16 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
             speak_sequence(sub, out, &mut has_content)?;
         }
     }
-    // `f'` -> "f prime", `f''` -> "f double prime", `f'''` -> "f triple
-    // prime" (derivative notation) — higher counts are vanishingly rare in
-    // practice, so just repeating "prime" is a reasonable fallback rather
-    // than a construct worth a full ordinal-naming table.
-    match attach.prime_count {
+    speak_primes(attach.prime_count, out);
+    Ok(())
+}
+
+/// `f'` -> "f prime", `f''` -> "f double prime", `f'''` -> "f triple
+/// prime" (derivative notation) — higher counts are vanishingly rare in
+/// practice, so just repeating "prime" is a reasonable fallback rather
+/// than a construct worth a full ordinal-naming table.
+fn speak_primes(count: usize, out: &mut String) {
+    match count {
         0 => {}
         1 => push_word(out, "prime"),
         2 => push_word(out, "double prime"),
@@ -905,7 +923,79 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
             }
         }
     }
-    Ok(())
+}
+
+/// `base`'s command name when it's nothing but a single bare, argument-
+/// less command (`\sum`, `\prod`, `\int`, `\lim`, ...) — `None` for
+/// anything else (a variable, an expression, a command that takes
+/// arguments). Used to recognize a "bound operator" base before speaking
+/// an `ItemAttachComponent` (see `speak_bound_operator`).
+fn base_command_name(base: &SyntaxNode) -> Option<String> {
+    let elements = flat_base_elements(base);
+    let [NodeOrToken::Node(n)] = elements.as_slice() else { return None };
+    if n.kind() != ItemCmd {
+        return None;
+    }
+    cmd_name(n)
+}
+
+/// Speaks a "bound operator" attach — `\sum`/`\prod`/`\int` with
+/// from/to bounds (`\sum_{i=1}^{n}` -> "the sum from i equals 1 to n
+/// of"), or `\lim` with an approach condition (`\lim_{x \to 0}` -> "the
+/// limit as x goes to 0 of"). Returns `false` for any other command name,
+/// so the caller falls back to the generic base-then-scripts phrasing.
+///
+/// These need their own phrasing because their bare (no attach) word
+/// already ends in "of" (`symbol_word("sum")` -> "the sum of", meant for
+/// a plain `\sum` with no bounds at all) — the generic sub/sup wording
+/// the rest of `speak_attach_scripts` uses ("sub X"/"to the X") would
+/// land *after* that "of", producing "the sum of to the n sub i equals
+/// 1" instead of putting the bounds where a person actually says them:
+/// between the operator name and "of".
+fn speak_bound_operator(name: &str, attach: &Attach, out: &mut String) -> Result<bool> {
+    let noun = match name {
+        "sum" => "the sum",
+        "prod" => "the product",
+        "int" => "the integral",
+        "lim" => "the limit",
+        _ => return Ok(false),
+    };
+
+    push_word(out, noun);
+    if name == "lim" {
+        // `\lim_{x \to 0}` — only ever a subscript (the approach
+        // condition), never a superscript.
+        if let Some(sub) = &attach.sub {
+            push_word(out, "as");
+            let mut has_content = false;
+            speak_sequence(sub, out, &mut has_content)?;
+        }
+    } else {
+        match (&attach.sub, &attach.sup) {
+            (Some(sub), Some(sup)) => {
+                push_word(out, "from");
+                let mut has_content = false;
+                speak_sequence(sub, out, &mut has_content)?;
+                push_word(out, "to");
+                let mut has_content = false;
+                speak_sequence(sup, out, &mut has_content)?;
+            }
+            (Some(sub), None) => {
+                push_word(out, "over");
+                let mut has_content = false;
+                speak_sequence(sub, out, &mut has_content)?;
+            }
+            (None, Some(sup)) => {
+                push_word(out, "up to");
+                let mut has_content = false;
+                speak_sequence(sup, out, &mut has_content)?;
+            }
+            (None, None) => {}
+        }
+    }
+    push_word(out, "of");
+    speak_primes(attach.prime_count, out);
+    Ok(true)
 }
 
 /// "th"/"st"/"nd"/"rd" for a braced ordinal superscript — `x^{th}` or
@@ -1974,6 +2064,36 @@ mod tests {
             speak(r"\begin{cases} 1 & \text{if } n = 0\\ 0 & \text{otherwise}. \end{cases}").unwrap(),
             "1 if n equals 0; 0 otherwise ."
         );
+    }
+
+    #[test]
+    fn sum_with_from_to_bounds() {
+        assert_eq!(speak(r"\sum_{i=1}^{n} i").unwrap(), "the sum from i equals 1 to n of i");
+    }
+
+    #[test]
+    fn prod_with_from_to_bounds() {
+        assert_eq!(speak(r"\prod_{k=1}^{n} k").unwrap(), "the product from k equals 1 to n of k");
+    }
+
+    #[test]
+    fn int_with_from_to_bounds() {
+        assert_eq!(speak(r"\int_{0}^{\infty} f(x)").unwrap(), "the integral from 0 to infinity of f of x");
+    }
+
+    #[test]
+    fn lim_with_approach_condition() {
+        assert_eq!(speak(r"\lim_{x \to 0} f(x)").unwrap(), "the limit as x goes to 0 of f of x");
+    }
+
+    #[test]
+    fn sum_with_only_subscript() {
+        assert_eq!(speak(r"\sum_{i} a_i").unwrap(), "the sum over i of a sub i");
+    }
+
+    #[test]
+    fn bare_sum_with_no_bounds_unaffected() {
+        assert_eq!(speak(r"\sum a_i").unwrap(), "the sum of a sub i");
     }
 
     // The real motivating case: a multi-line sum with `=&` alignment
