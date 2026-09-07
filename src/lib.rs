@@ -160,6 +160,31 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             }
         }
 
+        // Bare `a / b` division where `a` and `b` are the single elements
+        // immediately either side of the slash (mirrors the `\frac{a}{b}`
+        // "itself" collapse — see there for rationale). Deliberately
+        // narrow: only the two elements directly adjacent to the slash
+        // (skipping whitespace) are compared, not a wider expression, so
+        // this can't misfire on something like `a - b / a + b` by
+        // comparing the whole `a - b` / `a + b` sides.
+        if let NodeOrToken::Token(t) = &elements[i] {
+            if t.kind() == TokenSlash {
+                if let (Some(prev_idx), Some(next_idx)) =
+                    (prev_nontrivial_index(elements, i), next_nontrivial_index(elements, i))
+                {
+                    let prev_phrase = render_element_alone(&elements[prev_idx])?;
+                    let next_phrase = render_element_alone(&elements[next_idx])?;
+                    if !prev_phrase.is_empty() && prev_phrase == next_phrase {
+                        push_word(out, "over");
+                        push_word(out, "itself");
+                        *has_content = true;
+                        i = next_idx + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         speak_element(&elements[i], out, *has_content)?;
         // Tokens that `speak_element` speaks as nothing (see its match arms
         // below) must not count as "just spoke something" either, or the
@@ -178,6 +203,33 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         i += 1;
     }
     Ok(())
+}
+
+/// The index of the nearest element before `i` that isn't whitespace,
+/// a line break, or a comment — `None` if `i` is at (or past) the start
+/// of `elements` with nothing else in between.
+fn prev_nontrivial_index(elements: &[Element], i: usize) -> Option<usize> {
+    (0..i).rev().find(|&j| !is_trivial(&elements[j]))
+}
+
+/// The index of the nearest element after `i` that isn't whitespace, a
+/// line break, or a comment — `None` if nothing else follows.
+fn next_nontrivial_index(elements: &[Element], i: usize) -> Option<usize> {
+    (i + 1..elements.len()).find(|&j| !is_trivial(&elements[j]))
+}
+
+fn is_trivial(element: &Element) -> bool {
+    matches!(element, NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
+}
+
+/// Renders a single element in a fresh "nothing spoken yet" context,
+/// independent of its actual surroundings — used to compare what two
+/// elements *would* sound like on their own, e.g. the two sides of a
+/// bare `a / b` division.
+fn render_element_alone(element: &Element) -> Result<String> {
+    let mut out = String::new();
+    speak_element(element, &mut out, false)?;
+    Ok(out)
 }
 
 /// Splits an `ItemLR` node (`\left DELIM ... \right DELIM`) into the word
@@ -1375,6 +1427,11 @@ mod tests {
     #[test]
     fn slash_division() {
         assert_eq!(speak("5 / C").unwrap(), "5 over C");
+    }
+
+    #[test]
+    fn slash_division_repeated_operand_speaks_anaphorically() {
+        assert_eq!(speak("2^{n-1} / 2^{n-1}").unwrap(), "2 to the n minus 1 over itself");
     }
 
     #[test]
