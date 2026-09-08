@@ -68,7 +68,7 @@ type Element = NodeOrToken<SyntaxNode, mitex_parser::syntax::SyntaxToken>;
 fn speak_children(node: &SyntaxNode, out: &mut String) -> Result<()> {
     let elements: Vec<Element> = node.children_with_tokens().collect();
     let mut has_content = false;
-    speak_sequence(&elements, out, &mut has_content)
+    speak_sequence(&elements, out, &mut has_content, false)
 }
 
 /// Walks one flat sibling list (a node's direct children), phrasing
@@ -88,9 +88,25 @@ fn speak_children(node: &SyntaxNode, out: &mut String) -> Result<()> {
 /// operand's leading token (`p_1-p_2` parses `-p` as one word, the base of
 /// the second `_2` attach) and word-local position alone can't tell that
 /// apart from a truly leading `-`.
-fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool) -> Result<()> {
+fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool, relation_commas: bool) -> Result<()> {
     let mut i = 0;
+    // Only meaningful when `relation_commas` is set (currently just
+    // `speak_env`'s top-level row content): tracks whether a top-level
+    // relation/connective word (`=`, `\Rightarrow`, ...) has already been
+    // spoken in the *current row*, reset at each `ItemNewLine`. The first
+    // relation in a row stays a bare word — nothing precedes it yet — but
+    // each one after that gets `; word,`, so a row with several relations
+    // in sequence (`y = h*x \Rightarrow y[n] = ...`) reads as separate
+    // clauses instead of one run-on sentence.
+    let mut seen_relation_in_row = false;
     while i < elements.len() {
+        if relation_commas {
+            if let NodeOrToken::Token(t) = &elements[i] {
+                if t.kind() == ItemNewLine {
+                    seen_relation_in_row = false;
+                }
+            }
+        }
         let bracket = match &elements[i] {
             NodeOrToken::Token(t) if t.kind() == TokenLParen => Some((TokenLParen, TokenRParen, "of")),
             NodeOrToken::Token(t) if t.kind() == TokenLBracket => Some((TokenLBracket, TokenRBracket, "at index")),
@@ -124,7 +140,7 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                     push_word(out, word);
                 }
                 let mut inner_has_content = false;
-                speak_sequence(&elements[i + 1..j], out, &mut inner_has_content)?;
+                speak_sequence(&elements[i + 1..j], out, &mut inner_has_content, false)?;
                 if let NodeOrToken::Node(n) = &elements[j] {
                     speak_attach_scripts(&parse_attach(n)?, out)?;
                 }
@@ -151,11 +167,11 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                 };
                 push_word(out, "the interval from");
                 let mut lower_has_content = false;
-                speak_sequence(&inner[..comma_pos], out, &mut lower_has_content)?;
+                speak_sequence(&inner[..comma_pos], out, &mut lower_has_content, false)?;
                 push_word(out, if open_kind == TokenLBracket { "inclusive," } else { "exclusive," });
                 push_word(out, "to");
                 let mut upper_has_content = false;
-                speak_sequence(&inner[comma_pos + 1..], out, &mut upper_has_content)?;
+                speak_sequence(&inner[comma_pos + 1..], out, &mut upper_has_content, false)?;
                 push_word(out, if close_kind == TokenRBracket { "inclusive" } else { "exclusive" });
                 *has_content = true;
                 i = j + 1;
@@ -195,7 +211,7 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                     LRPrefix::Always(word) => push_word(out, word),
                 }
                 let mut inner_has_content = false;
-                speak_sequence(&inner, out, &mut inner_has_content)?;
+                speak_sequence(&inner, out, &mut inner_has_content, false)?;
                 *has_content = true;
                 i += 1;
                 continue;
@@ -295,7 +311,22 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             }
         }
 
+        // A second (or later) top-level relation/connective word within
+        // the same row (`y = h*x \Rightarrow y[n] = ...`) gets its own
+        // `; word,` clause break rather than running straight into the
+        // surrounding content — see `seen_relation_in_row`'s doc comment.
+        let is_top_level_relation = relation_commas
+            && render_element_alone(&elements[i]).ok().is_some_and(|phrase| is_relation_word(&phrase));
+        if is_top_level_relation && seen_relation_in_row {
+            out.push(';');
+        }
         speak_element(&elements[i], out, *has_content)?;
+        if is_top_level_relation {
+            if seen_relation_in_row {
+                out.push(',');
+            }
+            seen_relation_in_row = true;
+        }
         // Tokens that `speak_element` speaks as nothing (see its match arms
         // below) must not count as "just spoke something" either, or the
         // next real content wrongly triggers `(`/`[`'s "of"/"at index"
@@ -360,6 +391,38 @@ fn is_lone_plus(element: &Element) -> bool {
 /// right before the following bracket. Used to tell a genuine operand
 /// from a connective when deciding whether a `(...)`/`[...]` right after
 /// it means function application (see the `ItemLR` handling above).
+/// True for a relation word specifically (`=`/`\Rightarrow`/`\leq`/...),
+/// not the wider `is_connective_word` set — deliberately excludes plain
+/// arithmetic connectives (`plus`, `minus`, `times`, ...), which already
+/// have their own well-tested comma-free joining behavior in sums/series
+/// (see `align_environment_real_world_sum`) and shouldn't also pick up
+/// the `; word,` row-clause treatment `seen_relation_in_row` applies to
+/// relations in `speak_sequence`.
+fn is_relation_word(phrase: &str) -> bool {
+    const RELATIONS: &[&str] = &[
+        "equals",
+        "less than",
+        "greater than",
+        "less than or equal to",
+        "greater than or equal to",
+        "not equal to",
+        "approximately",
+        "is proportional to",
+        "on the order of",
+        "is much less than",
+        "is much greater than",
+        "is equivalent to",
+        "is perpendicular to",
+        "is parallel to",
+        "is an element of",
+        "is not an element of",
+        "implies",
+        "is implied by",
+        "if and only if",
+    ];
+    RELATIONS.iter().any(|c| phrase == *c || phrase.ends_with(&format!(" {c}")))
+}
+
 fn is_connective_word(phrase: &str) -> bool {
     const CONNECTIVES: &[&str] = &[
         "times",
@@ -794,8 +857,16 @@ fn speak_env(node: &SyntaxNode, out: &mut String) -> Result<()> {
         .children_with_tokens()
         .filter(|e| !matches!(e, NodeOrToken::Node(n) if n.kind() == ItemBegin || n.kind() == ItemEnd))
         .collect();
+    // A bare `=` between two plain words (`y = z`, no braces/commands in
+    // between) is grouped by mitex into one `ItemText` node alongside its
+    // neighboring words, not a standalone sibling — same gotcha
+    // `flatten_text_nodes` exists for elsewhere (interval-bound splitting).
+    // Flatten it here too so `speak_sequence`'s top-level relation-comma
+    // check (`seen_relation_in_row`) can actually see `=` as its own
+    // element instead of it being buried inside a merged text run.
+    let elements = flatten_text_nodes(&elements);
     let mut has_content = false;
-    speak_sequence(&elements, out, &mut has_content)
+    speak_sequence(&elements, out, &mut has_content, true)
 }
 
 struct Attach {
@@ -859,7 +930,7 @@ fn speak_attach(node: &SyntaxNode, out: &mut String, has_content: bool) -> Resul
                         }
                     }
                     let mut rest_has_content = true;
-                    speak_sequence(rest, out, &mut rest_has_content)?;
+                    speak_sequence(rest, out, &mut rest_has_content, false)?;
                     return speak_attach_scripts(&attach, out);
                 }
             }
@@ -903,7 +974,7 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
         } else {
             push_word(out, "to the");
             let mut has_content = false;
-            speak_sequence(sup, out, &mut has_content)?;
+            speak_sequence(sup, out, &mut has_content, false)?;
         }
     }
     if let Some(sub) = &attach.sub {
@@ -919,7 +990,7 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
         } else {
             push_word(out, "sub");
             let mut has_content = false;
-            speak_sequence(sub, out, &mut has_content)?;
+            speak_sequence(sub, out, &mut has_content, false)?;
         }
     }
     speak_primes(attach.prime_count, out);
@@ -987,27 +1058,27 @@ fn speak_bound_operator(name: &str, attach: &Attach, out: &mut String) -> Result
         if let Some(sub) = &attach.sub {
             push_word(out, "as");
             let mut has_content = false;
-            speak_sequence(sub, out, &mut has_content)?;
+            speak_sequence(sub, out, &mut has_content, false)?;
         }
     } else {
         match (&attach.sub, &attach.sup) {
             (Some(sub), Some(sup)) => {
                 push_word(out, "from");
                 let mut has_content = false;
-                speak_sequence(sub, out, &mut has_content)?;
+                speak_sequence(sub, out, &mut has_content, false)?;
                 push_word(out, "to");
                 let mut has_content = false;
-                speak_sequence(sup, out, &mut has_content)?;
+                speak_sequence(sup, out, &mut has_content, false)?;
             }
             (Some(sub), None) => {
                 push_word(out, "over");
                 let mut has_content = false;
-                speak_sequence(sub, out, &mut has_content)?;
+                speak_sequence(sub, out, &mut has_content, false)?;
             }
             (None, Some(sup)) => {
                 push_word(out, "up to");
                 let mut has_content = false;
-                speak_sequence(sup, out, &mut has_content)?;
+                speak_sequence(sup, out, &mut has_content, false)?;
             }
             (None, None) => {}
         }
@@ -2128,6 +2199,21 @@ mod tests {
             "x of t equals A sub 1, cosine of 2 pi, f sub 1, t plus phi sub 1; \
              plus, A sub 2, cosine of 2 pi, f sub 2, t plus phi sub 2; \
              plus, A sub 3, cosine of 2 pi, f sub 3, t plus phi sub 3 plus dot dot dot"
+        );
+    }
+
+    // A row with several top-level relations in sequence (`=`, `\Rightarrow`,
+    // `=`) reads as separate clauses: the first relation stays a bare word,
+    // each one after it gets `; word,` — see `seen_relation_in_row`'s doc
+    // comment. Arithmetic connectives (`plus`, `times`, ...) are unaffected;
+    // that's `align_environment_real_world_sum` above.
+    #[test]
+    fn align_environment_multiple_top_level_relations_in_one_row() {
+        assert_eq!(
+            speak(r"\begin{align*} y = h * x \Rightarrow y[n] &= h[K-1] \cdot x[n-(K-1)]\\ &= h[d] \end{align*}")
+                .unwrap(),
+            "y equals h asterisk x; implies, y at index n; equals, h at index K minus 1 \
+             times x at index n minus K minus 1; equals h at index d"
         );
     }
 
