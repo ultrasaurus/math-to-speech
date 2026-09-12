@@ -7,19 +7,53 @@
 //! fixed vocabulary of common symbols/Greek letters; anything else surfaces
 //! as an error rather than being mis-spoken.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{bail, Result};
 use mitex_parser::syntax::SyntaxKind::*;
 use mitex_parser::syntax::SyntaxNode;
 use mitex_spec_gen::DEFAULT_SPEC;
 use rowan::NodeOrToken;
 
+thread_local! {
+    // Scoped for the duration of one `speak_with_overrides` call (see
+    // there) — never left set across calls, so `speak`/`speak_with_overrides`
+    // stay pure from the caller's perspective despite this internal
+    // thread-local. Avoids threading an overrides parameter through every
+    // recursive `speak_*` function in this file for what's expected to
+    // stay a handful of caller-supplied phrasing exceptions.
+    static OVERRIDES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
 /// Convert LaTeX math source (no surrounding `$`/`\(`/`\[` delimiters) into
 /// spoken English text.
 pub fn speak(tex: &str) -> Result<String> {
-    let root = mitex_parser::parse(tex, DEFAULT_SPEC.clone());
-    let mut out = String::new();
-    speak_children(&root, &mut out)?;
-    Ok(collapse_whitespace(&out))
+    speak_with_overrides(tex, &HashMap::new())
+}
+
+/// Same as `speak`, but `overrides` replaces the spoken phrase for a
+/// matching raw LaTeX token/command name (no leading `\`, e.g. `"*"` or
+/// `"cdot"`) with its verbatim replacement text, wherever this crate would
+/// otherwise emit a fixed word for that token — e.g. `{"*": "convolved
+/// with"}` makes `h * x` read as "h convolved with x" instead of the
+/// default "h asterisk x".
+pub fn speak_with_overrides(tex: &str, overrides: &HashMap<String, String>) -> Result<String> {
+    OVERRIDES.with(|cell| *cell.borrow_mut() = overrides.clone());
+    let result = (|| {
+        let root = mitex_parser::parse(tex, DEFAULT_SPEC.clone());
+        let mut out = String::new();
+        speak_children(&root, &mut out)?;
+        Ok(collapse_whitespace(&out))
+    })();
+    OVERRIDES.with(|cell| cell.borrow_mut().clear());
+    result
+}
+
+/// The caller-supplied override phrase for raw token/command name `key`,
+/// if `speak_with_overrides` was given one — see its doc comment.
+fn override_for(key: &str) -> Option<String> {
+    OVERRIDES.with(|cell| cell.borrow().get(key).cloned())
 }
 
 /// Delimiter pairs `strip_math_delimiters` recognizes, checked in order
@@ -769,7 +803,7 @@ fn speak_element(element: &Element, out: &mut String, has_content: bool) -> Resu
                 Ok(())
             }
             TokenAsterisk => {
-                push_word(out, "asterisk");
+                push_word(out, &override_for("*").unwrap_or_else(|| "asterisk".to_string()));
                 Ok(())
             }
             TokenSlash => {
@@ -1509,7 +1543,7 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             Ok(())
         }
         _ => {
-            if let Some(word) = symbol_word(name) {
+            if let Some(word) = override_for(name).or_else(|| symbol_word(name).map(str::to_string)) {
                 // A list separator comma glued directly before the dots
                 // family (`1, 0, \dots` -> "1, 0, dot dot dot") leaves a
                 // pause immediately followed by three repeats of the same
@@ -1520,7 +1554,7 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
                 if matches!(name, "dots" | "ldots" | "cdots" | "vdots" | "ddots") && out.ends_with(',') {
                     out.pop();
                 }
-                push_word(out, word);
+                push_word(out, &word);
                 Ok(())
             } else {
                 bail!("unsupported command: \\{name}")
@@ -1701,7 +1735,7 @@ fn symbol_word(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{speak, strip_math_delimiters};
+    use super::{speak, speak_with_overrides, strip_math_delimiters};
 
     #[test]
     fn fraction() {
@@ -1950,6 +1984,30 @@ mod tests {
 
     #[test]
     fn bare_asterisk() {
+        assert_eq!(speak("*").unwrap(), "asterisk");
+    }
+
+    #[test]
+    fn override_replaces_asterisk_verbatim() {
+        let overrides = std::collections::HashMap::from([("*".to_string(), "convolved with".to_string())]);
+        assert_eq!(speak_with_overrides("h * x", &overrides).unwrap(), "h convolved with x");
+    }
+
+    #[test]
+    fn override_replaces_named_command() {
+        // Demonstrates the mechanism also covers `symbol_word` commands,
+        // not just `TokenAsterisk` — no claim that `\alpha` and "the
+        // growth rate" are related in general, just a convenient symbol
+        // to override for this test.
+        let overrides = std::collections::HashMap::from([("alpha".to_string(), "the growth rate".to_string())]);
+        assert_eq!(speak_with_overrides(r"\alpha", &overrides).unwrap(), "the growth rate");
+    }
+
+    #[test]
+    fn override_is_scoped_to_one_call() {
+        let overrides = std::collections::HashMap::from([("*".to_string(), "convolved with".to_string())]);
+        speak_with_overrides("h * x", &overrides).unwrap();
+        // A later plain `speak()` call must not see the previous call's overrides.
         assert_eq!(speak("*").unwrap(), "asterisk");
     }
 
