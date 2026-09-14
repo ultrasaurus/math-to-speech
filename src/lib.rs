@@ -837,7 +837,20 @@ fn speak_node(node: &SyntaxNode, out: &mut String, has_content: bool) -> Result<
     match node.kind() {
         ScopeRoot | ItemFormula => speak_children(node, out),
         ItemCurly => speak_children(node, out),
-        ItemText => speak_children(node, out),
+        // Unlike `ItemCurly`/`ScopeRoot`, an `ItemText` run doesn't
+        // necessarily start a fresh expression — mitex merges consecutive
+        // bare words into one `ItemText` node purely as a lexing artifact
+        // (e.g. `x[n] - x[n-1]`'s `- x[n-1]` portion is its own `ItemText`,
+        // right after the sibling `x[n]` bracket group). Seed its inner
+        // sequence with the caller's `has_content` instead of always
+        // `false`, so a leading bare `-` here still reads as subtraction
+        // when real content actually precedes it — same fix `speak_attach`
+        // already applies to its base for the analogous word-level case.
+        ItemText => {
+            let elements: Vec<Element> = node.children_with_tokens().collect();
+            let mut has_content = has_content;
+            speak_sequence(&elements, out, &mut has_content, false)
+        }
         ItemCmd => speak_cmd(node, out),
         ItemAttachComponent => speak_attach(node, out, has_content),
         ItemEnv => speak_env(node, out),
@@ -1911,6 +1924,21 @@ mod tests {
         assert_eq!(speak("p_1-p_2").unwrap(), "p sub 1 minus p sub 2");
         assert_eq!(speak("z_{m} - z_{k}").unwrap(), "z sub m minus z sub k");
         assert_eq!(speak("p_1 - p_2 + p_3").unwrap(), "p sub 1 minus p sub 2 plus p sub 3");
+    }
+
+    #[test]
+    fn subtraction_after_bracket_index_across_item_text_boundary() {
+        // Real reported bug: mitex merges consecutive bare words into one
+        // `ItemText` node, so `- x[n-1]` becomes its own `ItemText`
+        // separate from the `x[n]` that precedes it. `speak_children`
+        // always started that node's inner sequence at `has_content =
+        // false`, so the leading `-` looked like nothing had been spoken
+        // yet ("negative") even though `x[n]` was genuinely just spoken in
+        // the outer sequence ("minus" is correct: this is subtraction).
+        assert_eq!(
+            speak("y[n] = x[n] - x[n-1]").unwrap(),
+            "y at index n equals x at index n minus x at index n minus 1"
+        );
     }
 
     #[test]
