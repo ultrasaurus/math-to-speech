@@ -40,8 +40,9 @@ pub fn speak(tex: &str) -> Result<String> {
 /// default "h asterisk x".
 pub fn speak_with_overrides(tex: &str, overrides: &HashMap<String, String>) -> Result<String> {
     OVERRIDES.with(|cell| *cell.borrow_mut() = overrides.clone());
+    let tex = expand_bare_absolute_value_bars(tex);
     let result = (|| {
-        let root = mitex_parser::parse(tex, DEFAULT_SPEC.clone());
+        let root = mitex_parser::parse(&tex, DEFAULT_SPEC.clone());
         let mut out = String::new();
         speak_children(&root, &mut out)?;
         Ok(collapse_whitespace(&out))
@@ -73,6 +74,64 @@ pub fn strip_math_delimiters(tex: &str) -> (&str, Option<(&'static str, &'static
         }
     }
     (tex, None)
+}
+
+/// Rewrites a single bare `|...|` absolute-value pair (no `\left`/`\right`)
+/// into `\left|...\right|`, reusing the existing well-tested `ItemLR`
+/// handling for the rest of the pipeline rather than teaching the AST walk
+/// a second way to recognize the same construct. `|`/`\vert` has no
+/// dedicated token kind in mitex_parser: an *unglued* bare `|` (` | ` or
+/// start/end of expression) comes through as its own `TokenWord`, but one
+/// glued directly onto an adjacent word (`|x`, `x[n-1]|`) gets folded into
+/// that word's token instead — either shape would need its own bespoke
+/// handling in the AST walker, whereas rewriting the raw text once here
+/// sidesteps both.
+///
+/// Deliberately conservative: only fires when the *whole* input has
+/// exactly two un-escaped `|` characters outside any existing
+/// `\left|`/`\right|`/`\vert`/`\lvert`/`\rvert` — i.e. one unambiguous,
+/// non-nested pair. Zero, one, 3+, or already-explicit bars are left
+/// untouched rather than guessed at: a bare `|` is also used for
+/// set-builder "such that" and conditional-probability notation, and
+/// nested bars (`||x|-y|`) can't be paired correctly by a simple first-to-
+/// next scan — same "reject rather than guess" policy this crate applies
+/// to matrix environments.
+fn expand_bare_absolute_value_bars(tex: &str) -> String {
+    const EXPLICIT_FORMS: &[&str] = &["\\left|", "\\right|", "\\vert", "\\lvert", "\\rvert"];
+
+    // Blank out already-explicit bar commands and escaped `\|` (a distinct
+    // double-bar symbol, not absolute value) before counting, so their `|`
+    // characters aren't mistaken for bare ones — same length as the
+    // original so byte offsets below still line up.
+    let mut masked = tex.to_string();
+    for form in EXPLICIT_FORMS {
+        let mut start = 0;
+        while let Some(pos) = masked[start..].find(form) {
+            let abs = start + pos;
+            masked.replace_range(abs..abs + form.len(), &" ".repeat(form.len()));
+            start = abs + form.len();
+        }
+    }
+    let mut start = 0;
+    while let Some(pos) = masked[start..].find("\\|") {
+        let abs = start + pos;
+        masked.replace_range(abs..abs + 2, "  ");
+        start = abs + 2;
+    }
+
+    let bare_positions: Vec<usize> = masked
+        .char_indices()
+        .filter_map(|(i, c)| (c == '|').then_some(i))
+        .collect();
+    let [open, close] = bare_positions.as_slice() else { return tex.to_string() };
+
+    let mut out = String::with_capacity(tex.len() + 10);
+    out.push_str(&tex[..*open]);
+    out.push_str("\\left|");
+    out.push_str(&tex[open + 1..*close]);
+    out.push_str("\\right|");
+    out.push_str(&tex[close + 1..]);
+    out
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -2102,6 +2161,20 @@ mod tests {
         assert_eq!(
             speak(r"\left|v\left(-2^{n-1}\right)\right|").unwrap(),
             "the absolute value of v of negative 2 to the n minus 1"
+        );
+    }
+
+    #[test]
+    fn bare_absolute_value_bars_without_left_right() {
+        // Real reported bug: a bare `|...|` pair (no `\left`/`\right`) fell
+        // straight through to the literal-token pass-through, printing the
+        // `|` characters verbatim instead of reading as absolute value —
+        // only the `\left|...\right|` form (a dedicated `ItemLR` node) was
+        // recognized.
+        assert_eq!(speak(r"|x|").unwrap(), "the absolute value of x");
+        assert_eq!(
+            speak(r"\frac{1}{2} \cdot |x[n] + x[n-1]|").unwrap(),
+            "1 half times the absolute value of x at index n plus x at index n minus 1"
         );
     }
 
