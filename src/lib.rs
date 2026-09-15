@@ -413,7 +413,24 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         if is_top_level_relation && seen_relation_in_row {
             out.push(';');
         }
-        speak_element(&elements[i], out, *has_content)?;
+        // A bare `-` (not glued to a number — see `speak_operator_word`'s
+        // doc comment) right after a connective/relation word (`x = -\sin(t)`)
+        // is a leading sign, not subtraction, even though `has_content` is
+        // already true from "equals" — `\sin` can't glue the `-` onto itself
+        // the way `-1` glues, so this can't be caught by the glued-token path
+        // `x = -1` relies on. Same `prev_is_connective` check already used
+        // for the bracket "of"/"at index" decision above.
+        let is_bare_minus = matches!(&elements[i], NodeOrToken::Token(t) if t.kind() == TokenWord && t.text() == "-");
+        let element_has_content = if is_bare_minus
+            && prev_nontrivial_index(elements, i)
+                .and_then(|k| render_element_alone(&elements[k]).ok())
+                .is_some_and(|phrase| is_connective_word(&phrase))
+        {
+            false
+        } else {
+            *has_content
+        };
+        speak_element(&elements[i], out, element_has_content)?;
         if is_top_level_relation {
             if seen_relation_in_row {
                 out.push(',');
@@ -2011,6 +2028,18 @@ mod tests {
         // Must NOT regress: `has_content` being true (from "x ="` already
         // spoken) must not make a self-contained `-1` read as "minus 1".
         assert_eq!(speak("x = -1").unwrap(), "x equals negative 1");
+    }
+
+    #[test]
+    fn leading_negative_before_glued_command_after_relation_stays_negative() {
+        // `\sin` is a separate command node, so `-` can't glue onto it the
+        // way it glues onto `-1` — this hits the bare-`-` token path, which
+        // must still resolve to "negative" right after "equals", not
+        // "minus" (regression: previously read "minus sine of ...").
+        assert_eq!(
+            speak(r"x(t) = -\sin(4\pi t + \pi)").unwrap(),
+            "x of t equals negative sine of 4 pi t plus pi"
+        );
     }
 
     #[test]
