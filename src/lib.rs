@@ -1532,6 +1532,13 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
         // grouping" treatment applies: the braces themselves aren't
         // spoken, same as `TokenLBrace`/`TokenRBrace` for a plain group.
         "{" | "}" => Ok(()),
+        // `\%` — LaTeX's escaped literal percent sign (needed because a
+        // bare `%` starts a comment), same "escaped literal" shape as
+        // `\{`/`\}` above but this one has a pronunciation of its own.
+        "%" => {
+            push_word(out, "percent");
+            Ok(())
+        }
         "leftarrow" => {
             // Context this vocabulary was built against is algorithmic
             // assignment (`\hat{X} \leftarrow \text{DFT}(...)`), not a
@@ -1787,6 +1794,8 @@ fn symbol_word(name: &str) -> Option<&'static str> {
         "notin" => "is not an element of",
         "mid" => "such that",
         "rightarrow" | "to" => "goes to",
+        "uparrow" => "up arrow",
+        "downarrow" => "down arrow",
         "Rightarrow" => "implies",
         "Leftarrow" => "is implied by",
         "Leftrightarrow" => "if and only if",
@@ -2249,6 +2258,17 @@ mod tests {
     fn phantom_content_is_never_spoken() {
         assert_eq!(speak(r"a \phantom{x} b").unwrap(), "a b");
         assert_eq!(speak(r"a \vphantom{x} b").unwrap(), "a b");
+    }
+
+    #[test]
+    fn up_down_arrows() {
+        assert_eq!(speak(r"\uparrow").unwrap(), "up arrow");
+        assert_eq!(speak(r"\downarrow").unwrap(), "down arrow");
+    }
+
+    #[test]
+    fn percent_sign() {
+        assert_eq!(speak(r"2.3\%").unwrap(), "2.3 percent");
     }
 
     #[test]
