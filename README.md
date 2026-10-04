@@ -55,14 +55,25 @@ when something was just spoken immediately before it:
 discrete-time signal notation don't collapse to the same phrase),
 * `\sin(x)` → "sine of x".
 
-A bracket with nothing before it is plain grouping instead:
+A bracket with nothing before it, or only an operator/relation like `=`
+or `+`, is plain grouping instead:
 * `[a, b]` → "a, b",
-* `(a+b)*c` → "a+b * c"
+* `x = (a+b)` → "x equals a plus b"
 
-A bracketed denominator holding more than one term after a `/` gets "the
-quantity", since the silent parens would otherwise leave it ambiguous:
+A number or another bracket group before a bracket means multiplication,
+not function application: `2(a+b)` → "2 times the quantity a plus b".
+
+Since the brackets are silent, a group holding more than one term joined
+by an operator is spoken as "the quantity ..." wherever its extent would
+otherwise be ambiguous — divided, dividing, raised to a power, or
+multiplied — with a comma closing it when more follows:
 * `a/(b \times c)` → "a over the quantity b times c",
-* `a/(b)` → "a over b".
+* `(a+b)^2/c` → "the quantity a plus b, squared, over c",
+* `a/(b+c) + d` → "a over the quantity b plus c, plus d",
+* `a/(b)` → "a over b", `a/(2\pi)` → "a over 2 pi" (one term).
+
+`\frac` numerators/denominators follow the same rule, so `\frac{a+b}{c}`
+and `(a+b)/c` read identically.
 
 Parens/brackets themselves stay silent. Only parenthesized function application
 is handled; a bare `\sin x` (no parens) currently speaks as "sine x",

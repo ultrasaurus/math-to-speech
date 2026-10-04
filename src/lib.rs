@@ -207,22 +207,11 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         };
         if let Some((open_kind, close_kind, word)) = bracket {
             if let Some(j) = matching_close(elements, i, open_kind, close_kind) {
-                // See the `ItemLR` handling in this same function for why
-                // a connective word immediately before the bracket (`x =
-                // (a+b)`, `V \cdot (...)`) must not trigger the `x(t)`
-                // "of"/"at index" function-application wording.
-                let prev_is_connective = prev_nontrivial_index(elements, i)
-                    .and_then(|k| render_element_alone(&elements[k]).ok())
-                    .is_some_and(|phrase| is_connective_word(&phrase));
-                if *has_content && !prev_is_connective {
-                    push_word(out, word);
-                }
-                let mut inner_has_content = false;
-                speak_sequence(&elements[i + 1..j], out, &mut inner_has_content, false)?;
-                if let NodeOrToken::Node(n) = &elements[j] {
-                    speak_attach_scripts(&parse_attach(n)?, out)?;
-                }
-                *has_content = true;
+                let scripts = match &elements[j] {
+                    NodeOrToken::Node(n) => Some(parse_attach(n)?),
+                    NodeOrToken::Token(_) => None,
+                };
+                speak_bracket_group(elements, i, j, &elements[i + 1..j], word, scripts.as_ref(), out, has_content)?;
                 i = j + 1;
                 continue;
             }
@@ -267,32 +256,42 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
         if let NodeOrToken::Node(node) = &elements[i] {
             if node.kind() == ItemLR {
                 let (prefix, inner) = left_right_group(node)?;
-                // A connective word (`\cdot`, `+`, `=`, `\leq`, ...) spoken
-                // immediately before this group doesn't count as "an
-                // operand was just spoken" for `IfPreceded` purposes — only
-                // an actual value/expression/function name does. Without
-                // this, `V \cdot (\frac{a}{b})` reads as "V times of a over
-                // b": `\cdot` already set `has_content`, so the grouping
-                // paren wrongly took the `x(t)` "of" phrasing meant for
-                // function application, not "times" followed by a plain
-                // grouped multiplicand.
-                let prev_is_connective = prev_nontrivial_index(elements, i)
-                    .and_then(|j| render_element_alone(&elements[j]).ok())
-                    .is_some_and(|phrase| is_connective_word(&phrase));
                 match prefix {
-                    LRPrefix::None => {}
-                    LRPrefix::IfPreceded(word) => {
-                        if *has_content && !prev_is_connective {
-                            push_word(out, word);
-                        }
+                    LRPrefix::None => {
+                        let mut inner_has_content = false;
+                        speak_sequence(&inner, out, &mut inner_has_content, false)?;
+                        *has_content = true;
                     }
-                    LRPrefix::Always(word) => push_word(out, word),
+                    LRPrefix::IfPreceded(word) => {
+                        speak_bracket_group(elements, i, i, &inner, word, None, out, has_content)?;
+                    }
+                    LRPrefix::Always(word) => {
+                        push_word(out, word);
+                        let mut inner_has_content = false;
+                        speak_sequence(&inner, out, &mut inner_has_content, false)?;
+                        *has_content = true;
+                    }
                 }
-                let mut inner_has_content = false;
-                speak_sequence(&inner, out, &mut inner_has_content, false)?;
-                *has_content = true;
                 i += 1;
                 continue;
+            }
+            // `\left(a+b\right)^2` — the script attaches to the whole
+            // `ItemLR` group (unlike a bare `(a+b)^2`, where it lands on
+            // the closing `)` token), so the group arrives wrapped in an
+            // attach node instead.
+            if node.kind() == ItemAttachComponent {
+                let attach = parse_attach(node)?;
+                let base: Vec<Element> =
+                    attach.base.children_with_tokens().filter(|e| !is_trivial(e)).collect();
+                if let [NodeOrToken::Node(lr)] = base.as_slice() {
+                    if lr.kind() == ItemLR {
+                        if let (LRPrefix::IfPreceded(word), inner) = left_right_group(lr)? {
+                            speak_bracket_group(elements, i, i, &inner, word, Some(&attach), out, has_content)?;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -356,22 +355,6 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                             i = next_idx + 1;
                             continue;
                         }
-                    }
-                    // A bracketed multi-term denominator (`a/(b \times c)`)
-                    // gets "the quantity" so the listener can tell the whole
-                    // group is divided, not just its first term — the
-                    // brackets themselves are silent, so "a over b times c"
-                    // would be ambiguous. A single-term group (`a/(b)`)
-                    // isn't ambiguous and reads as plain "a over b". The
-                    // group itself is then spoken by the bracket handling
-                    // above on the next iteration; "over" counts as a
-                    // connective there, so it doesn't add "of".
-                    if is_compound_group(elements, next_idx) {
-                        push_word(out, "over");
-                        push_word(out, "the quantity");
-                        *has_content = true;
-                        i = next_idx;
-                        continue;
                     }
                 }
             }
@@ -439,6 +422,9 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             *has_content
         };
         speak_element(&elements[i], out, element_has_content)?;
+        if frac_ends_with_quantity(&elements[i]) && continues_after(elements, i) {
+            out.push(',');
+        }
         if is_top_level_relation {
             if seen_relation_in_row {
                 out.push(',');
@@ -502,39 +488,188 @@ fn matching_close(
     None
 }
 
-/// True when `elements[idx]` opens a `(...)`/`[...]` group (bare bracket
-/// tokens or a `\left...\right` pair) holding more than one term —
-/// `(b \times c)`, `(2\pi)`, `(a+b)` — as opposed to a single operand
-/// like `(b)`, `(P_{ii})`, or `(-b)`. Unmatched brackets and other
-/// delimiters (`\left| ... \right|`, which already speaks its own "the
-/// absolute value of") are never compound groups.
-fn is_compound_group(elements: &[Element], idx: usize) -> bool {
-    let inner = match &elements[idx] {
-        NodeOrToken::Token(t) if matches!(t.kind(), TokenLParen | TokenLBracket) => {
-            let close_kind = if t.kind() == TokenLParen { TokenRParen } else { TokenRBracket };
-            let Some(j) = matching_close(elements, idx, t.kind(), close_kind) else {
-                return false;
-            };
-            elements[idx + 1..j].to_vec()
-        }
-        NodeOrToken::Node(n) if n.kind() == ItemLR => match left_right_group(n) {
-            Ok((LRPrefix::IfPreceded(_), inner)) => inner,
-            _ => return false,
-        },
-        _ => return false,
+/// Speaks one `(...)`/`[...]` group — bare bracket tokens spanning
+/// `elements[open_idx..=close_idx]`, or a single `\left...\right` node
+/// (`open_idx == close_idx`) — whose content is `inner` and whose closing
+/// bracket carries `scripts` (`(a+b)^2`), if any.
+///
+/// What precedes the group decides the lead-in word:
+/// * an operand (`x(t)`, `x[n]`) -> `application_word` ("of"/"at
+///   index"), i.e. function application;
+/// * a number or another bracket group (`2(a+b)`, `(a+b)(c+d)`) ->
+///   "times" — neither is a function, so this is multiplication;
+/// * a connective word (`x = (a+b)`, `V \cdot (...)`) or nothing at all
+///   -> no word, plain grouping. A connective doesn't count as "an
+///   operand was just spoken": without this check, `V \cdot
+///   (\frac{a}{b})` read "V times of a over b".
+///
+/// The brackets themselves are silent, so a multi-term group (see
+/// `is_compound`) is marked as "the quantity ..." wherever the listener
+/// would otherwise mis-hear where it ends: when it's divided (`(a+b)/c`)
+/// or divides (`a/(b+c)`), raised to a power (`(x-2)^2`), or multiplied
+/// by a leading number or an adjacent group (`2(a+b)`, `(a+b)(c+d)`).
+/// A comma closes the quantity before
+/// whatever follows it — "the quantity a plus b, squared, over c" —
+/// so `a/(b+c) + d` doesn't blur `d` into the denominator.
+#[allow(clippy::too_many_arguments)]
+fn speak_bracket_group(
+    elements: &[Element],
+    open_idx: usize,
+    close_idx: usize,
+    inner: &[Element],
+    application_word: &'static str,
+    scripts: Option<&Attach>,
+    out: &mut String,
+    has_content: &mut bool,
+) -> Result<()> {
+    let prev_idx = prev_nontrivial_index(elements, open_idx);
+    let prev_is_connective = prev_idx
+        .and_then(|k| render_element_alone(&elements[k]).ok())
+        .is_some_and(|phrase| is_connective_word(&phrase));
+    let prev_is_multiplier = prev_idx.is_some_and(|k| {
+        ends_with_number(&elements[k]) || matches!(element_bracket_kind(&elements[k]), Some(TokenRParen | TokenRBracket))
+    });
+    let next_idx = next_nontrivial_index(elements, close_idx);
+    let is_slash = |idx: Option<usize>| {
+        idx.is_some_and(|k| matches!(&elements[k], NodeOrToken::Token(t) if t.kind() == TokenSlash))
     };
-    let terms: Vec<Element> = flatten_text_nodes(&inner).into_iter().filter(|e| !is_trivial(e)).collect();
-    match terms.as_slice() {
-        [] => false,
-        // `mitex` lexes a glued run like `a+b` as one `TokenWord`, so a
-        // single token can still hold several terms — detectable as a
-        // multi-word phrase once its leading negative sign (`-b` ->
-        // "negative b", still one term) is set aside.
-        [NodeOrToken::Token(t)] if t.kind() == TokenWord => speak_operator_word(t.text(), false)
-            .is_some_and(|phrase| phrase.trim_start_matches("negative ").contains(' ')),
-        [_] => false,
-        _ => true,
+    let next_is_paren_group = next_idx.is_some_and(|k| match &elements[k] {
+        NodeOrToken::Token(t) => t.kind() == TokenLParen,
+        NodeOrToken::Node(n) => {
+            n.kind() == ItemLR && matches!(left_right_group(n), Ok((LRPrefix::IfPreceded("of"), _)))
+        }
+    });
+    let has_scripts = scripts.is_some_and(|a| a.sub.is_some() || a.sup.is_some() || a.prime_count > 0);
+
+    let lead = if *has_content && !prev_is_connective {
+        Some(if prev_is_multiplier { "times" } else { application_word })
+    } else {
+        None
+    };
+    let is_application = lead.is_some_and(|w| w == application_word);
+    let quantity = !is_application
+        && is_compound(inner)
+        && (lead.is_some() || is_slash(prev_idx) || is_slash(next_idx) || next_is_paren_group || has_scripts);
+
+    if let Some(word) = lead {
+        push_word(out, word);
     }
+    if quantity {
+        push_word(out, "the quantity");
+    }
+    let mut inner_has_content = false;
+    speak_sequence(inner, out, &mut inner_has_content, false)?;
+    if let Some(attach) = scripts {
+        if quantity && has_scripts {
+            out.push(',');
+        }
+        speak_attach_scripts(attach, out)?;
+    }
+    if quantity && continues_after(elements, close_idx) {
+        out.push(',');
+    }
+    *has_content = true;
+    Ok(())
+}
+
+/// True when more content follows `elements[idx]` within this same
+/// sequence — anything other than the end of the sequence, a row break,
+/// a comma, or a closing brace — so a quantity ending at `idx` needs a
+/// comma to separate it from what comes next.
+fn continues_after(elements: &[Element], idx: usize) -> bool {
+    next_nontrivial_index(elements, idx).is_some_and(|k| {
+        !matches!(&elements[k], NodeOrToken::Token(t) if matches!(t.kind(), ItemNewLine | TokenComma | TokenRBrace))
+    })
+}
+
+/// True when `element` ends in a literal number — a bare `2`, a negative
+/// `-2`, or the tail of a glued run like `x-2` or a text run like `x =
+/// 2` — so a bracket right after it is multiplication, not function
+/// application. A subscript like `x_2` doesn't count: `x_2(t)` is still
+/// "x sub 2 of t".
+fn ends_with_number(element: &Element) -> bool {
+    let last_token = match element {
+        NodeOrToken::Token(t) => Some(t.clone()),
+        NodeOrToken::Node(n) if n.kind() == ItemText => n
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
+            .last(),
+        NodeOrToken::Node(_) => None,
+    };
+    let Some(tok) = last_token else { return false };
+    if tok.kind() != TokenWord {
+        return false;
+    }
+    let tail = tok.text().rsplit(['-', '+', '=', '<', '>']).next().unwrap_or("");
+    !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '.') && tail.chars().any(|c| c.is_ascii_digit())
+}
+
+/// True when `inner` (a bracket group's content, or a `\frac` argument)
+/// is more than one term joined by an operator at its own top level —
+/// `a+b`, `x - 2`, `b \times c`, `a/b` — so a listener needs "the
+/// quantity" to hear where it starts and ends. Juxtaposed factors (`2\pi`,
+/// `2\pi f C`) aren't compound: "1 over 2 pi f C" is already the
+/// conventional spoken reading of `\frac{1}{2\pi f C}`. A leading sign
+/// (`-b`, `\pm b`) is part of its one term, and operators nested in an
+/// inner bracket (`f(a+b)`) don't count at this level.
+fn is_compound(inner: &[Element]) -> bool {
+    let terms: Vec<Element> = flatten_text_nodes(&unwrap_script_braces(inner))
+        .into_iter()
+        .filter(|e| !is_trivial(e) && !matches!(e, NodeOrToken::Token(t) if matches!(t.kind(), TokenLBrace | TokenRBrace)))
+        .collect();
+    // Content that's nothing but one redundantly bracketed group
+    // (`\frac{1}{(x-2)}`) is compound exactly when that group's own
+    // content is.
+    if let Some(NodeOrToken::Token(open)) = terms.first() {
+        if matches!(open.kind(), TokenLParen | TokenLBracket) {
+            let close_kind = if open.kind() == TokenLParen { TokenRParen } else { TokenRBracket };
+            if matching_close(&terms, 0, open.kind(), close_kind) == Some(terms.len() - 1)
+                && matches!(terms.last(), Some(NodeOrToken::Token(_)))
+            {
+                return is_compound(&terms[1..terms.len() - 1]);
+            }
+        }
+    }
+    let mut depth = 0usize;
+    for (k, e) in terms.iter().enumerate() {
+        match element_bracket_kind(e) {
+            Some(TokenLParen | TokenLBracket) => {
+                depth += 1;
+                continue;
+            }
+            Some(_) => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            None => {}
+        }
+        if depth > 0 {
+            continue;
+        }
+        let operator = match e {
+            NodeOrToken::Token(t) => match t.kind() {
+                // `mitex` glues `a+b` into a single word, so an operator
+                // can sit inside one token; one at position 0 is a
+                // leading sign, unless something precedes this token.
+                TokenWord => t
+                    .text()
+                    .char_indices()
+                    .any(|(p, c)| matches!(c, '-' | '+' | '=' | '<' | '>') && (p > 0 || k > 0)),
+                TokenSlash | TokenAsterisk => k > 0,
+                _ => false,
+            },
+            NodeOrToken::Node(n) => {
+                k > 0
+                    && n.kind() == ItemCmd
+                    && render_element_alone(e).ok().is_some_and(|phrase| is_connective_word(&phrase))
+            }
+        };
+        if operator {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_trivial(element: &Element) -> bool {
@@ -789,8 +924,19 @@ fn named_fraction_word(numerator: &str, denominator: &str) -> Option<&'static st
 /// parse than "over itself"), a named fraction word when both sides are
 /// small bare integers (see `named_fraction_word`), or a plain "N over M"
 /// otherwise.
-fn speak_fraction(num_phrase: &str, den_phrase: &str, out: &mut String) {
+///
+/// A multi-term numerator/denominator (`num_quantity`/`den_quantity`, see
+/// `is_compound`) is spoken as "the quantity ..." — the same marking a
+/// bracketed operand of `/` gets, so `\frac{a+b}{c}` and `(a+b)/c` read
+/// alike — with a comma closing the numerator before "over".
+fn speak_fraction(num_phrase: &str, den_phrase: &str, num_quantity: bool, den_quantity: bool, out: &mut String) {
+    if num_quantity {
+        push_word(out, "the quantity");
+    }
     push_word(out, num_phrase);
+    if num_quantity {
+        out.push(',');
+    }
     if den_phrase == num_phrase {
         push_word(out, "over");
         push_word(out, "itself");
@@ -798,8 +944,37 @@ fn speak_fraction(num_phrase: &str, den_phrase: &str, out: &mut String) {
         push_word(out, word);
     } else {
         push_word(out, "over");
+        if den_quantity {
+            push_word(out, "the quantity");
+        }
         push_word(out, den_phrase);
     }
+}
+
+/// True for a `\frac` whose denominator is a multi-term quantity (see
+/// `is_compound`) — its spoken phrase ends mid-quantity, so whatever
+/// follows needs a separating comma (`\frac{a}{b+c} + d` -> "a over the
+/// quantity b plus c, plus d").
+fn frac_ends_with_quantity(element: &Element) -> bool {
+    let NodeOrToken::Node(node) = element else { return false };
+    if node.kind() != ItemCmd || cmd_name(node).as_deref() != Some("frac") {
+        return false;
+    }
+    let args: Vec<SyntaxNode> = node.children().filter(|n| n.kind() == ClauseArgument).collect();
+    let [num, den] = args.as_slice() else { return false };
+    let num_phrase = render_frac_arg(num);
+    let den_phrase = render_frac_arg(den);
+    // "over itself" / a named fraction word replaces the denominator
+    // phrase entirely, so nothing is left open.
+    is_compound(&den.children_with_tokens().collect::<Vec<_>>())
+        && num_phrase != den_phrase
+        && named_fraction_word(&num_phrase, &den_phrase).is_none()
+}
+
+fn render_frac_arg(arg: &SyntaxNode) -> String {
+    let mut phrase = String::new();
+    speak_children(arg, &mut phrase).ok();
+    phrase
 }
 
 /// The word (if any) an `ItemLR`'s opening delimiter contributes, and
@@ -1571,7 +1746,9 @@ fn speak_cmd(node: &SyntaxNode, out: &mut String) -> Result<()> {
             speak_children(num, &mut num_phrase)?;
             let mut den_phrase = String::new();
             speak_children(den, &mut den_phrase)?;
-            speak_fraction(&num_phrase, &den_phrase, out);
+            let num_quantity = is_compound(&num.children_with_tokens().collect::<Vec<_>>());
+            let den_quantity = is_compound(&den.children_with_tokens().collect::<Vec<_>>());
+            speak_fraction(&num_phrase, &den_phrase, num_quantity, den_quantity, out);
             Ok(())
         }
         "sqrt" => {
@@ -2258,8 +2435,54 @@ mod tests {
     fn slash_division_bracketed_compound_denominator_speaks_the_quantity() {
         assert_eq!(speak(r"a/(b \times c)").unwrap(), "a over the quantity b times c");
         assert_eq!(speak("a/(a+b)").unwrap(), "a over the quantity a plus b");
-        assert_eq!(speak(r"a/(2\pi)").unwrap(), "a over the quantity 2 pi");
+        assert_eq!(speak(r"a/(a-b)").unwrap(), "a over the quantity a minus b");
+        assert_eq!(speak(r"a/((b+c))").unwrap(), "a over the quantity b plus c");
         assert_eq!(speak(r"a/\left(b \times c\right)").unwrap(), "a over the quantity b times c");
+    }
+
+    #[test]
+    fn juxtaposed_factors_are_not_a_quantity() {
+        assert_eq!(speak(r"a/(2\pi)").unwrap(), "a over 2 pi");
+        assert_eq!(speak(r"\frac{2\pi}{T}").unwrap(), "2 pi over T");
+        assert_eq!(speak(r"\frac{1}{2\pi f C}").unwrap(), "1 over 2 pi f C");
+    }
+
+    #[test]
+    fn slash_division_bracketed_compound_numerator_speaks_the_quantity() {
+        assert_eq!(speak("(a+b)/c").unwrap(), "the quantity a plus b, over c");
+        assert_eq!(speak("(a+b)/(c+d)").unwrap(), "the quantity a plus b, over the quantity c plus d");
+        assert_eq!(speak("(a+b)^2/c").unwrap(), "the quantity a plus b, squared, over c");
+        assert_eq!(speak(r"\left(a+b\right)^2/c").unwrap(), "the quantity a plus b, squared, over c");
+    }
+
+    #[test]
+    fn quantity_is_closed_by_a_comma_when_more_follows() {
+        assert_eq!(speak("a/(b+c) + d").unwrap(), "a over the quantity b plus c, plus d");
+        assert_eq!(speak("a/(b+c) = d").unwrap(), "a over the quantity b plus c, equals d");
+        assert_eq!(speak(r"\frac{a}{b+c} + d").unwrap(), "a over the quantity b plus c, plus d");
+        assert_eq!(speak(r"\frac{a}{b+c}").unwrap(), "a over the quantity b plus c");
+    }
+
+    #[test]
+    fn frac_compound_parts_match_slash_division() {
+        assert_eq!(speak(r"\frac{a+b}{c+d}").unwrap(), speak("(a+b)/(c+d)").unwrap());
+        assert_eq!(speak(r"\frac{a+b}{a+b}").unwrap(), "the quantity a plus b, over itself");
+        assert_eq!(
+            speak(r"\frac{|P_{io}|^2}{P_{ii} \times P_{oo}}").unwrap(),
+            "the absolute value of P sub io squared over the quantity P sub ii times P sub oo"
+        );
+    }
+
+    #[test]
+    fn group_after_number_or_group_is_multiplication() {
+        assert_eq!(speak("2(a+b)").unwrap(), "2 times the quantity a plus b");
+        assert_eq!(speak("2(a+b)/c").unwrap(), "2 times the quantity a plus b, over c");
+        assert_eq!(speak("x = 2(a+b) + c").unwrap(), "x equals 2 times the quantity a plus b, plus c");
+        assert_eq!(speak("(a+b)(c+d)").unwrap(), "the quantity a plus b, times the quantity c plus d");
+        assert_eq!(speak("(a)(b)").unwrap(), "a times b");
+        // Still function application after an operand, subscripted or not.
+        assert_eq!(speak("x_2(t)").unwrap(), "x sub 2 of t");
+        assert_eq!(speak("f(a+b)/c").unwrap(), "f of a plus b over c");
     }
 
     #[test]
@@ -2606,7 +2829,8 @@ mod tests {
 
     #[test]
     fn closing_bracket_with_exponent() {
-        assert_eq!(speak(r"(x-2)^2").unwrap(), "x minus 2 squared");
+        assert_eq!(speak(r"(x-2)^2").unwrap(), "the quantity x minus 2, squared");
+        assert_eq!(speak(r"(x)^2").unwrap(), "x squared");
     }
 
     #[test]
@@ -2647,7 +2871,7 @@ mod tests {
 
     #[test]
     fn braces_dont_trigger_of_on_the_paren_they_precede() {
-        assert_eq!(speak(r"\frac{1}{(x-2)}").unwrap(), "1 over x minus 2");
+        assert_eq!(speak(r"\frac{1}{(x-2)}").unwrap(), "1 over the quantity x minus 2");
     }
 
     #[test]
