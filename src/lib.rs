@@ -206,22 +206,7 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
             _ => None,
         };
         if let Some((open_kind, close_kind, word)) = bracket {
-            let mut depth = 1;
-            let mut j = i + 1;
-            while j < elements.len() {
-                if let Some(kind) = element_bracket_kind(&elements[j]) {
-                    if kind == open_kind {
-                        depth += 1;
-                    } else if kind == close_kind {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                j += 1;
-            }
-            if j < elements.len() {
+            if let Some(j) = matching_close(elements, i, open_kind, close_kind) {
                 // See the `ItemLR` handling in this same function for why
                 // a connective word immediately before the bracket (`x =
                 // (a+b)`, `V \cdot (...)`) must not trigger the `x(t)`
@@ -345,24 +330,47 @@ fn speak_sequence(elements: &[Element], out: &mut String, has_content: &mut bool
                 if let (Some(prev_idx), Some(next_idx)) =
                     (prev_nontrivial_index(elements, i), next_nontrivial_index(elements, i))
                 {
-                    let prev_phrase = render_element_alone(&elements[prev_idx])?;
-                    let next_phrase = render_element_alone(&elements[next_idx])?;
-                    if !prev_phrase.is_empty() && prev_phrase == next_phrase {
-                        push_word(out, "over");
-                        push_word(out, "itself");
-                        *has_content = true;
-                        i = next_idx + 1;
-                        continue;
+                    // Either neighbor may be a bare bracket token (`a/(b)`,
+                    // `(a)/b`) that only means something as part of its
+                    // whole group, so it can't be spoken on its own — that
+                    // just means neither shortcut below applies, not that
+                    // the expression is unsupported.
+                    let prev_phrase = render_element_alone(&elements[prev_idx]).ok();
+                    let next_phrase = render_element_alone(&elements[next_idx]).ok();
+                    if let (Some(prev_phrase), Some(next_phrase)) = (prev_phrase, next_phrase) {
+                        if !prev_phrase.is_empty() && prev_phrase == next_phrase {
+                            push_word(out, "over");
+                            push_word(out, "itself");
+                            *has_content = true;
+                            i = next_idx + 1;
+                            continue;
+                        }
+                        // A small named fraction (`3 / 2` -> "three halves") —
+                        // see `named_fraction_word`'s doc comment. `prev_phrase`
+                        // is already sitting in `out` from the previous loop
+                        // iteration, so only the denominator's word is pushed
+                        // here, in place of "over" + the denominator itself.
+                        if let Some(word) = named_fraction_word(&prev_phrase, &next_phrase) {
+                            push_word(out, word);
+                            *has_content = true;
+                            i = next_idx + 1;
+                            continue;
+                        }
                     }
-                    // A small named fraction (`3 / 2` -> "three halves") —
-                    // see `named_fraction_word`'s doc comment. `prev_phrase`
-                    // is already sitting in `out` from the previous loop
-                    // iteration, so only the denominator's word is pushed
-                    // here, in place of "over" + the denominator itself.
-                    if let Some(word) = named_fraction_word(&prev_phrase, &next_phrase) {
-                        push_word(out, word);
+                    // A bracketed multi-term denominator (`a/(b \times c)`)
+                    // gets "the quantity" so the listener can tell the whole
+                    // group is divided, not just its first term — the
+                    // brackets themselves are silent, so "a over b times c"
+                    // would be ambiguous. A single-term group (`a/(b)`)
+                    // isn't ambiguous and reads as plain "a over b". The
+                    // group itself is then spoken by the bracket handling
+                    // above on the next iteration; "over" counts as a
+                    // connective there, so it doesn't add "of".
+                    if is_compound_group(elements, next_idx) {
+                        push_word(out, "over");
+                        push_word(out, "the quantity");
                         *has_content = true;
-                        i = next_idx + 1;
+                        i = next_idx;
                         continue;
                     }
                 }
@@ -469,6 +477,66 @@ fn next_nontrivial_index(elements: &[Element], i: usize) -> Option<usize> {
     (i + 1..elements.len()).find(|&j| !is_trivial(&elements[j]))
 }
 
+/// The index of the bracket closing the `open_kind` bracket at `open_idx`
+/// — tracks nesting of the same bracket kind, so `((a)b)` matches the
+/// outer `)` — or `None` if it's never closed.
+fn matching_close(
+    elements: &[Element],
+    open_idx: usize,
+    open_kind: mitex_parser::syntax::SyntaxKind,
+    close_kind: mitex_parser::syntax::SyntaxKind,
+) -> Option<usize> {
+    let mut depth = 0;
+    for (j, e) in elements.iter().enumerate().skip(open_idx + 1) {
+        match element_bracket_kind(e) {
+            Some(kind) if kind == open_kind => depth += 1,
+            Some(kind) if kind == close_kind => {
+                if depth == 0 {
+                    return Some(j);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when `elements[idx]` opens a `(...)`/`[...]` group (bare bracket
+/// tokens or a `\left...\right` pair) holding more than one term —
+/// `(b \times c)`, `(2\pi)`, `(a+b)` — as opposed to a single operand
+/// like `(b)`, `(P_{ii})`, or `(-b)`. Unmatched brackets and other
+/// delimiters (`\left| ... \right|`, which already speaks its own "the
+/// absolute value of") are never compound groups.
+fn is_compound_group(elements: &[Element], idx: usize) -> bool {
+    let inner = match &elements[idx] {
+        NodeOrToken::Token(t) if matches!(t.kind(), TokenLParen | TokenLBracket) => {
+            let close_kind = if t.kind() == TokenLParen { TokenRParen } else { TokenRBracket };
+            let Some(j) = matching_close(elements, idx, t.kind(), close_kind) else {
+                return false;
+            };
+            elements[idx + 1..j].to_vec()
+        }
+        NodeOrToken::Node(n) if n.kind() == ItemLR => match left_right_group(n) {
+            Ok((LRPrefix::IfPreceded(_), inner)) => inner,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let terms: Vec<Element> = flatten_text_nodes(&inner).into_iter().filter(|e| !is_trivial(e)).collect();
+    match terms.as_slice() {
+        [] => false,
+        // `mitex` lexes a glued run like `a+b` as one `TokenWord`, so a
+        // single token can still hold several terms — detectable as a
+        // multi-word phrase once its leading negative sign (`-b` ->
+        // "negative b", still one term) is set aside.
+        [NodeOrToken::Token(t)] if t.kind() == TokenWord => speak_operator_word(t.text(), false)
+            .is_some_and(|phrase| phrase.trim_start_matches("negative ").contains(' ')),
+        [_] => false,
+        _ => true,
+    }
+}
+
 fn is_trivial(element: &Element) -> bool {
     matches!(element, NodeOrToken::Token(t) if matches!(t.kind(), TokenWhiteSpace | TokenLineBreak | TokenComment))
 }
@@ -536,6 +604,7 @@ fn is_relation_word(phrase: &str) -> bool {
 fn is_connective_word(phrase: &str) -> bool {
     const CONNECTIVES: &[&str] = &[
         "times",
+        "over",
         "plus",
         "minus",
         "negative",
@@ -1090,9 +1159,9 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
             // No `push_word` here — an ordinal suffix attaches directly to
             // the base with no space: "n" + "th" -> "nth", not "n th".
             out.push_str(suffix);
-        } else if let Some(power) = simple_power_word(sup) {
+        } else if let Some(power) = simple_power_word(&unwrap_script_braces(sup)) {
             push_word(out, power);
-        } else if is_degree_symbol(sup) {
+        } else if is_degree_symbol(&unwrap_script_braces(sup)) {
             push_word(out, "degrees");
         } else {
             push_word(out, "to the");
@@ -1101,7 +1170,7 @@ fn speak_attach_scripts(attach: &Attach, out: &mut String) -> Result<()> {
         }
     }
     if let Some(sub) = &attach.sub {
-        if let Some(word) = component_subscript_word(sub) {
+        if let Some(word) = component_subscript_word(&unwrap_script_braces(sub)) {
             // `x_\perp`/`x_\parallel` name a *component* of `x` (the
             // perpendicular/parallel part of a decomposed vector or
             // signal, common notation in physics/DSP), not a literal
@@ -1306,6 +1375,27 @@ fn unwrap_text_command(node: &SyntaxNode) -> Option<SyntaxNode> {
         return None;
     };
     Some(curly.clone())
+}
+
+/// A script's content with one layer of `{...}` stripped — `^{2}` ->
+/// the same `2` as `^2`, `_{\perp}` -> the same `\perp` as `_\perp` —
+/// so the single-token shape checks (`simple_power_word`,
+/// `is_degree_symbol`, `component_subscript_word`) treat braced and
+/// unbraced scripts alike. Whitespace inside the braces is dropped and a
+/// run of plain text is flattened to its tokens. Anything that isn't
+/// exactly one `{...}` group comes back unchanged.
+fn unwrap_script_braces(script: &[Element]) -> Vec<Element> {
+    let [Element::Node(curly)] = script else {
+        return script.to_vec();
+    };
+    if curly.kind() != ItemCurly {
+        return script.to_vec();
+    }
+    let inner: Vec<Element> = curly
+        .children_with_tokens()
+        .filter(|e| !matches!(e, NodeOrToken::Token(t) if t.kind() == TokenLBrace || t.kind() == TokenRBrace))
+        .collect();
+    flatten_text_nodes(&inner).into_iter().filter(|e| !is_trivial(e)).collect()
 }
 
 /// "squared" / "cubed" for a bare `^2` / `^3` superscript; `None` for
@@ -1877,6 +1967,16 @@ mod tests {
     }
 
     #[test]
+    fn braced_single_token_scripts_speak_like_unbraced() {
+        assert_eq!(speak("r^{2}").unwrap(), "r squared");
+        assert_eq!(speak("r^{ 3 }").unwrap(), "r cubed");
+        assert_eq!(speak("x_{i}^{2}").unwrap(), "x squared sub i");
+        assert_eq!(speak(r"360^{\circ}").unwrap(), "360 degrees");
+        assert_eq!(speak(r"x_{\perp}").unwrap(), "x perpendicular");
+        assert_eq!(speak("r^{10}").unwrap(), "r to the 10");
+    }
+
+    #[test]
     fn general_power() {
         assert_eq!(speak("x^n").unwrap(), "x to the n");
     }
@@ -2144,6 +2244,30 @@ mod tests {
     #[test]
     fn slash_division_repeated_operand_speaks_anaphorically() {
         assert_eq!(speak("2^{n-1} / 2^{n-1}").unwrap(), "2 to the n minus 1 over itself");
+    }
+
+    #[test]
+    fn slash_division_bracketed_single_term_operand() {
+        assert_eq!(speak("a/(b)").unwrap(), "a over b");
+        assert_eq!(speak("(a)/b").unwrap(), "a over b");
+        assert_eq!(speak("a/[b]").unwrap(), "a over b");
+        assert_eq!(speak("a/(-b)").unwrap(), "a over negative b");
+    }
+
+    #[test]
+    fn slash_division_bracketed_compound_denominator_speaks_the_quantity() {
+        assert_eq!(speak(r"a/(b \times c)").unwrap(), "a over the quantity b times c");
+        assert_eq!(speak("a/(a+b)").unwrap(), "a over the quantity a plus b");
+        assert_eq!(speak(r"a/(2\pi)").unwrap(), "a over the quantity 2 pi");
+        assert_eq!(speak(r"a/\left(b \times c\right)").unwrap(), "a over the quantity b times c");
+    }
+
+    #[test]
+    fn slash_division_real_world_coherence_formula() {
+        assert_eq!(
+            speak(r"C_{io} = |P_{io}|^2/(P_{ii} \times P_{oo})").unwrap(),
+            "C sub io equals the absolute value of P sub io squared over the quantity P sub ii times P sub oo"
+        );
     }
 
     #[test]

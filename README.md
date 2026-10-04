@@ -59,6 +59,11 @@ A bracket with nothing before it is plain grouping instead:
 * `[a, b]` → "a, b",
 * `(a+b)*c` → "a+b * c"
 
+A bracketed denominator holding more than one term after a `/` gets "the
+quantity", since the silent parens would otherwise leave it ambiguous:
+* `a/(b \times c)` → "a over the quantity b times c",
+* `a/(b)` → "a over b".
+
 Parens/brackets themselves stay silent. Only parenthesized function application
 is handled; a bare `\sin x` (no parens) currently speaks as "sine x",
 not "sine of x".
