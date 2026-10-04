@@ -72,7 +72,18 @@ multiplied — with a comma closing it when more follows:
 * `a/(b+c) + d` → "a over the quantity b plus c, plus d",
 * `a/(b)` → "a over b", `a/(2\pi)` → "a over 2 pi" (one term).
 
-`\frac` numerators/denominators follow the same rule, so `\frac{a+b}{c}`
+A multi-term numerator that starts a top-level clause uses the more
+natural "all over" instead — `(a+b)/c` → "a plus b, all over c",
+`x = (a+b)/c` → "x equals a plus b, all over c". Anywhere else (`d +
+(a+b)/c`, or nested inside another construct) it keeps "the quantity",
+since "all" would reach back over `d` too.
+
+A fraction followed by more arithmetic gets a comma, since "a over c
+plus d" could mean either reading: `a/c + d` → "a over c, plus d". A
+relation needs none (`a/c = d` → "a over c equals d"), nor does a named
+fraction (`3/2 + 1` → "3 halves plus 1").
+
+`\frac` numerators/denominators follow the same rules, so `\frac{a+b}{c}`
 and `(a+b)/c` read identically.
 
 Parens/brackets themselves stay silent. Only parenthesized function application
